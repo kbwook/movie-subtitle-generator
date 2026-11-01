@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 from pipeline.extractor import SUPPORTED_VIDEO_EXTENSIONS, inspect_video_metadata
 from pipeline.models import VideoMediaInfo
 from pipeline.runner import collect_video_files, load_config, process_video_file, save_config
+from pipeline.telemetry import detect_hardware_inventory
 from pipeline.translator import LocalLLMTranslator
 
 
@@ -91,6 +92,7 @@ class SubtitleGeneratorGUI:
         ttk.Button(toolbar, text="🧹 완료 항목 정리", command=self._on_clear_completed).pack(side="left", padx=2)
         ttk.Button(toolbar, text="🔄 전체 비우기", command=self._on_clear_all).pack(side="left", padx=2)
 
+        ttk.Button(toolbar, text="📊 성능 리포트 열기", command=self._on_open_perf_log).pack(side="right", padx=2)
         ttk.Button(toolbar, text="📂 선택 파일 폴더 열기", command=self._on_open_folder).pack(side="right", padx=2)
         self.queue_count_var = tk.StringVar(value="등록된 영화: 0편")
         ttk.Label(toolbar, textvariable=self.queue_count_var, font=("맑은 고딕", 9, "bold")).pack(
@@ -431,6 +433,13 @@ class SubtitleGeneratorGUI:
     def _check_llm_status_async(self) -> None:
         def _worker():
             self._sync_ui_to_config()
+            hw = detect_hardware_inventory()
+            self._append_log(
+                f"[하드웨어 진단] CPU: {hw.cpu_name} ({hw.logical_cores}코어) | "
+                f"GPU: {', '.join(hw.gpus) or '없음'} | "
+                f"NPU: {', '.join(hw.npus) or '없음'} | "
+                f"RAM: 가용 {hw.avail_ram_gb:.1f}GB/{hw.total_ram_gb:.1f}GB"
+            )
             translator = LocalLLMTranslator(self.config.get("llm", {}))
             ok, msg = translator.check_server_and_model()
             short_msg = msg.splitlines()[0]
@@ -438,6 +447,16 @@ class SubtitleGeneratorGUI:
             self._append_log(f"[시스템 점검] {msg}")
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_open_perf_log(self) -> None:
+        log_file = Path(__file__).resolve().parent / "logs" / "perf_report.log"
+        if log_file.exists():
+            os.startfile(str(log_file))
+        else:
+            messagebox.showinfo(
+                "성능 리포트 없음",
+                "아직 기록된 성능 리포트(logs/perf_report.log)가 없습니다.\n영화 자막 생성이 완료되면 자동으로 기록됩니다.",
+            )
 
     def _on_pull_or_check_model(self) -> None:
         model_name = self.llm_var.get().strip()
@@ -754,7 +773,7 @@ class SubtitleGeneratorGUI:
                             self.queue_prog_var.set(overall_pct)
                             self.stage_label_var.set(f"{stage} ({pct:.1f}%)")
                             self.file_prog_var.set(pct)
-                            self.detail_label_var.set(detail)
+                            self.detail_label_var.set(detail.splitlines()[0] if detail else "")
 
                         self.root.after(0, _ui)
                         update_item_status(f"{stage} ({pct:.0f}%)", iid)

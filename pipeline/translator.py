@@ -5,6 +5,8 @@
    직전 N개 대사(문맥 참조용) + 현재 번역할 M개 대사 묶음을 JSON 스키마로 전달합니다.
 2. 타임스탬프 ID가 밀리거나 누락되지 않도록 ID 매핑 검증을 수행하며,
    혹시 LLM이 일부 문장을 누락한 경우 해당 문장만 개별 재번역(Fallback)하여 100% 싱크를 보장합니다.
+3. Ollama `/api/ps` 및 응답 메타데이터(`eval_count`, `eval_duration`, `load_duration`)를 분석하여
+   실제 사용된 연산 장치(CPU vs Intel Arc GPU Vulkan 오프로딩 비율)와 초당 토큰 속도(t/s)를 로깅합니다.
 """
 
 from __future__ import annotations
@@ -17,11 +19,12 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
 from pipeline.models import SubtitleSegment
+from pipeline.telemetry import query_ollama_processor_status
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +41,7 @@ LANG_KO_NAMES = {
 
 
 class LocalLLMTranslator:
-    """Ollama 로컬 API를 이용한 영화 자막 전문 번역기."""
+    """Ollama 로컬 API를 이용한 영화 자막 전문 번역기 (하드웨어 가속 및 타이밍 텔레메트리 내장)."""
 
     def __init__(self, llm_config: Dict):
         self.base_url = llm_config.get("base_url", "http://localhost:11434").rstrip("/")
@@ -48,6 +51,7 @@ class LocalLLMTranslator:
         self.temperature = float(llm_config.get("temperature", 0.2))
         self.timeout_sec = int(llm_config.get("timeout_sec", 180))
         self.movie_context = llm_config.get("movie_context", "").strip()
+        self.last_telemetry: Dict[str, Any] = {}
 
     def _try_start_ollama_server(self) -> bool:
         """Ollama 서버가 꺼져 있을 때 Intel Arc Vulkan 가속(OLLAMA_VULKAN=1)과 함께 자동 구동합니다."""
@@ -104,14 +108,13 @@ class LocalLLMTranslator:
             data = resp.json()
             models = [m.get("name", "") for m in data.get("models", [])]
 
-            # 태그 정확 일치 또는 기본 이름 일치 확인 (예: qwen2.5:7b)
             target_prefix = self.model.split(":")[0]
             if any(m == self.model or m.startswith(self.model) for m in models):
-                return True, f"Ollama 연결 정상 (모델: {self.model}, Vulkan 가속 활성)"
+                return True, f"Ollama 연결 정상 (모델: {self.model}, Vulkan 가속 설정됨)"
             if any(m.startswith(target_prefix) for m in models):
                 matched = next(m for m in models if m.startswith(target_prefix))
                 self.model = matched
-                return True, f"Ollama 연결 정상 (감지된 모델: {self.model}, Vulkan 가속 활성)"
+                return True, f"Ollama 연결 정상 (감지된 모델: {self.model}, Vulkan 가속 설정됨)"
 
             return (
                 False,
@@ -131,10 +134,20 @@ class LocalLLMTranslator:
         target_lang: str = "한국어",
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ) -> List[SubtitleSegment]:
-        """전체 자막 세그먼트를 슬라이딩 윈도우 배치 방식으로 한국어 번역합니다."""
+        """전체 자막 세그먼트를 슬라이딩 윈도우 배치 방식으로 한국어 번역하고 하드웨어/시간 지표를 수집합니다."""
         total = len(segments)
         if total == 0:
             return segments
+
+        t_stage_start = time.perf_counter()
+        total_load_ns = 0
+        total_prompt_tokens = 0
+        total_prompt_ns = 0
+        total_eval_tokens = 0
+        total_eval_ns = 0
+        batches_count = 0
+        fallback_count = 0
+        ps_info: Dict[str, Any] = {}
 
         src_lang_name = LANG_KO_NAMES.get(source_lang, source_lang)
         logger.info(
@@ -146,30 +159,91 @@ class LocalLLMTranslator:
             end_idx = min(start_idx + self.batch_size, total)
             current_batch = segments[start_idx:end_idx]
 
-            # 직전 문맥 추출 (이미 번역 완료된 직전 대사들)
             ctx_start = max(0, start_idx - self.context_size)
             context_segments = segments[ctx_start:start_idx]
 
-            batch_translations = self._translate_batch(
+            batch_translations, stats = self._translate_batch(
                 current_batch,
                 context_segments,
                 src_lang_name,
                 target_lang,
             )
+            batches_count += 1
+            total_load_ns += stats.get("load_duration", 0)
+            total_prompt_tokens += stats.get("prompt_eval_count", 0)
+            total_prompt_ns += stats.get("prompt_eval_duration", 0)
+            total_eval_tokens += stats.get("eval_count", 0)
+            total_eval_ns += stats.get("eval_duration", 0)
 
-            # 결과 매핑 및 누락 시 단문 폴백 번역
+            # 첫 번째 배치가 메모리에 적재된 직후 /api/ps를 조회하여 실제 GPU/CPU 오프로딩 상태 확인
+            if batches_count == 1:
+                ps_info = query_ollama_processor_status(self.base_url, self.model)
+                logger.info(
+                    "[LLM 하드웨어 가속 상태] 장치=%s | 상세=%s",
+                    ps_info.get("accelerator"),
+                    ps_info.get("processor_summary"),
+                )
+
             for seg in current_batch:
                 translated = batch_translations.get(seg.id)
                 if not translated:
-                    translated = self._translate_single_fallback(
+                    fallback_count += 1
+                    translated, fb_stats = self._translate_single_fallback(
                         seg.original_text, src_lang_name, target_lang
                     )
+                    total_eval_tokens += fb_stats.get("eval_count", 0)
+                    total_eval_ns += fb_stats.get("eval_duration", 0)
                 seg.translated_text = translated.strip()
 
             if progress_callback:
                 pct = (end_idx / total) * 100.0
+                elapsed_now = time.perf_counter() - t_stage_start
+                tok_s = (total_eval_tokens / (total_eval_ns / 1e9)) if total_eval_ns > 0 else 0.0
+                accel_short = ps_info.get("accelerator", "LLM")
                 sample = current_batch[-1].translated_text or ""
-                progress_callback(pct, f"[{end_idx}/{total}] {sample[:40]}")
+                progress_callback(
+                    pct,
+                    f"[{end_idx}/{total} | {accel_short} | {tok_s:.1f} tok/s | 경과 {elapsed_now:.0f}s] {sample[:32]}",
+                )
+
+        total_elapsed = time.perf_counter() - t_stage_start
+        model_load_sec = total_load_ns / 1e9
+        compute_sec = max(0.0, total_elapsed - model_load_sec)
+        eval_tok_per_sec = (total_eval_tokens / (total_eval_ns / 1e9)) if total_eval_ns > 0 else 0.0
+        prompt_tok_per_sec = (
+            (total_prompt_tokens / (total_prompt_ns / 1e9)) if total_prompt_ns > 0 else 0.0
+        )
+
+        if not ps_info:
+            ps_info = query_ollama_processor_status(self.base_url, self.model)
+
+        accel_type = ps_info.get("accelerator", "CPU/GPU")
+        proc_summary = ps_info.get("processor_summary", f"Ollama ({self.model})")
+
+        self.last_telemetry = {
+            "accelerator_type": accel_type,
+            "backend_detail": f"{proc_summary} [model={self.model}, batch={self.batch_size}]",
+            "elapsed_sec": round(total_elapsed, 2),
+            "model_load_sec": round(model_load_sec, 2),
+            "compute_sec": round(compute_sec, 2),
+            "items_processed": total,
+            "throughput_label": (
+                f"생성 {eval_tok_per_sec:.1f} tok/s (프롬프트 {prompt_tok_per_sec:.1f} tok/s, "
+                f"문장당 {total_elapsed / max(1, total):.2f}초)"
+            ),
+            "extra_metrics": {
+                "model": self.model,
+                "gpu_offload_pct": ps_info.get("gpu_offload_pct", 0.0),
+                "size_total_mb": ps_info.get("size_total_mb", 0.0),
+                "size_vram_mb": ps_info.get("size_vram_mb", 0.0),
+                "prompt_tokens": total_prompt_tokens,
+                "eval_tokens": total_eval_tokens,
+                "eval_tok_per_sec": round(eval_tok_per_sec, 2),
+                "prompt_tok_per_sec": round(prompt_tok_per_sec, 2),
+                "batches_count": batches_count,
+                "fallback_count": fallback_count,
+            },
+        }
 
         return segments
 
@@ -179,8 +253,8 @@ class LocalLLMTranslator:
         context_segments: List[SubtitleSegment],
         src_lang_name: str,
         target_lang: str,
-    ) -> Dict[int, str]:
-        """배치 단위 JSON 구조화 번역을 수행합니다."""
+    ) -> tuple[Dict[int, str], Dict[str, int]]:
+        """배치 단위 JSON 구조화 번역을 수행하고 Ollama 타이밍 통계를 함께 반환합니다."""
         context_lines = []
         for c in context_segments:
             context_lines.append(
@@ -230,18 +304,25 @@ class LocalLLMTranslator:
                 timeout=self.timeout_sec,
             )
             resp.raise_for_status()
-            content = resp.json().get("message", {}).get("content", "")
-            return self._parse_json_response(content)
+            body = resp.json()
+            content = body.get("message", {}).get("content", "")
+            stats = {
+                "load_duration": int(body.get("load_duration", 0)),
+                "prompt_eval_count": int(body.get("prompt_eval_count", 0)),
+                "prompt_eval_duration": int(body.get("prompt_eval_duration", 0)),
+                "eval_count": int(body.get("eval_count", 0)),
+                "eval_duration": int(body.get("eval_duration", 0)),
+            }
+            return self._parse_json_response(content), stats
         except Exception as exc:
             logger.warning("배치 번역 중 오류 발생 (개별 폴백 번역으로 전환): %s", exc)
-            return {}
+            return {}, {}
 
     @staticmethod
     def _parse_json_response(content: str) -> Dict[int, str]:
         """LLM의 JSON 응답에서 id -> 번역문 딕셔너리를 안전하게 추출합니다."""
         result: Dict[int, str] = {}
         try:
-            # 마크다운 코드블록 제거 방어 로직
             cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.MULTILINE)
             data = json.loads(cleaned)
 
@@ -278,7 +359,7 @@ class LocalLLMTranslator:
         text: str,
         src_lang_name: str,
         target_lang: str,
-    ) -> str:
+    ) -> tuple[str, Dict[str, int]]:
         """배치 JSON에서 누락된 단일 문장을 개별 번역합니다."""
         payload = {
             "model": self.model,
@@ -302,8 +383,13 @@ class LocalLLMTranslator:
                 timeout=60,
             )
             resp.raise_for_status()
-            out = resp.json().get("message", {}).get("content", "").strip()
-            return out if out else text
+            body = resp.json()
+            out = body.get("message", {}).get("content", "").strip()
+            stats = {
+                "eval_count": int(body.get("eval_count", 0)),
+                "eval_duration": int(body.get("eval_duration", 0)),
+            }
+            return (out if out else text), stats
         except Exception as exc:
             logger.error("단일 문장 번역 실패 (원문 유지): %s", exc)
-            return text
+            return text, {}

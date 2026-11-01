@@ -19,6 +19,12 @@ from pipeline.extractor import (
 )
 from pipeline.formatter import write_ass, write_srt
 from pipeline.models import SubtitleSegment
+from pipeline.telemetry import (
+    JobTelemetryReport,
+    StageMetric,
+    detect_hardware_inventory,
+    save_telemetry_report,
+)
 from pipeline.transcriber import load_wav_as_float32
 from pipeline.translator import LocalLLMTranslator
 
@@ -163,6 +169,50 @@ class PipelineTest(unittest.TestCase):
                 self.assertEqual(len(app.queue_order), 0)
         finally:
             root.destroy()
+
+    def test_hardware_telemetry_and_report_logging(self) -> None:
+        hw = detect_hardware_inventory()
+        self.assertGreater(hw.logical_cores, 0)
+        self.assertGreater(hw.total_ram_gb, 0.0)
+
+        report = JobTelemetryReport(
+            timestamp="2026-11-01 12:55:00",
+            video_name="sample_movie.mkv",
+            video_codec="H264",
+            audio_codec="AAC",
+            video_duration_sec=3600.0,
+            detected_language="fr",
+            hardware=hw,
+            stages=[
+                StageMetric(
+                    stage_name="1/4 오디오 추출",
+                    accelerator_type="CPU",
+                    backend_detail="PyAV (16kHz Mono PCM)",
+                    elapsed_sec=8.5,
+                    compute_sec=8.5,
+                    throughput_label="423.5x 실시간 배속",
+                ),
+                StageMetric(
+                    stage_name="2/4 음성 인식 (STT)",
+                    accelerator_type="CPU",
+                    backend_detail="Faster-Whisper INT8 (12 threads)",
+                    elapsed_sec=600.0,
+                    model_load_sec=2.1,
+                    compute_sec=597.9,
+                    items_processed=850,
+                    throughput_label="6.0x 실시간 배속",
+                ),
+            ],
+            total_elapsed_sec=608.5,
+            optimization_notes=["STT 단계 OpenVINO GPU/NPU 전환 가능"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            txt_path = save_telemetry_report(report, project_root=Path(tmp))
+            self.assertTrue(txt_path.exists())
+            content = txt_path.read_text(encoding="utf-8")
+            self.assertIn("성능 및 하드웨어 가속 리포트", content)
+            self.assertIn("Faster-Whisper INT8", content)
 
 
 if __name__ == "__main__":

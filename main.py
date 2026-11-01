@@ -26,6 +26,7 @@ from pathlib import Path
 
 from pipeline.extractor import list_audio_tracks
 from pipeline.runner import collect_video_files, load_config, process_video_file
+from pipeline.telemetry import detect_hardware_inventory
 from pipeline.translator import LocalLLMTranslator
 
 
@@ -122,8 +123,14 @@ def main() -> int:
         config["subtitle"]["bilingual"] = True
 
     if args.check_env:
-        print("=== 로컬 AI 영화 자막 생성기 환경 점검 ===")
-        print(f"- STT 모델 설정: {config['stt']['model_size']} (threads={config['stt']['cpu_threads']}, compute={config['stt']['compute_type']})")
+        hw = detect_hardware_inventory()
+        print("=== 로컬 AI 영화 자막 생성기 하드웨어 및 환경 점검 ===")
+        print(f"- CPU: {hw.cpu_name} ({hw.logical_cores} 논리 코어)")
+        print(f"- GPU: {', '.join(hw.gpus) or '감지 안 됨'}")
+        print(f"- NPU: {', '.join(hw.npus) or '감지 안 됨'}")
+        print(f"- RAM: 가용 {hw.avail_ram_gb:.1f} GB / 전체 {hw.total_ram_gb:.1f} GB")
+        print(f"- ONNX 프로바이더: {', '.join(hw.onnx_providers)}")
+        print(f"- STT 모델 설정: {config['stt']['model_size']} (device={config['stt'].get('device', 'cpu')}, threads={config['stt']['cpu_threads']}, compute={config['stt']['compute_type']})")
         translator = LocalLLMTranslator(config.get("llm", {}))
         ok, msg = translator.check_server_and_model()
         print(f"- LLM 상태: {'[정상]' if ok else '[조치 필요]'} {msg}")

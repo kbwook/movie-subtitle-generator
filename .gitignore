@@ -5,10 +5,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Generated subtitle / audio temporary files
+# Generated subtitle / audio temporary files & performance logs
 *.wav
 *.srt
 *.ass
+logs/
 
 # IDE & OS files
 .vscode/
