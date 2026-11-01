@@ -1,0 +1,45 @@
+# 로컬 영화 자막 생성기 설정 (Intel Core Ultra 7 155H + Intel Arc + 32GB RAM 최적화)
+
+stt:
+  # 추천 모델: "large-v3-turbo" (속도/품질 최적), "large-v3" (최고 정확도), "medium" (저사양용)
+  model_size: "large-v3-turbo"
+  # 실행 장치: faster-whisper 기준 Intel 환경에서는 "cpu" + int8 멀티스레드가 가장 안정적이며 빠름
+  device: "cpu"
+  compute_type: "int8"
+  # Intel Core Ultra 7 155H (16코어 22스레드) 최적 스레드 수
+  cpu_threads: 12
+  # 원본 음성 언어 ("auto": 자동 감지, "zh": 중국어, "ja": 일본어, "en": 영어)
+  language: "auto"
+  beam_size: 5
+  # 영화 배경음악(BGM) 및 무음 구간에서 발생하는 환각(Hallucination) 방지용 Silero VAD 설정
+  vad_filter: true
+  vad_parameters:
+    min_silence_duration_ms: 500
+    speech_pad_ms: 250
+
+llm:
+  provider: "ollama"
+  base_url: "http://localhost:11434"
+  # 32GB RAM 기준 추천:
+  # - 밸런스/속도 우선: "qwen2.5:7b" (약 5GB 메모리)
+  # - 고품질 번역 우선: "qwen2.5:14b" (약 9.5GB 메모리)
+  model: "qwen2.5:7b"
+  # 한 번에 번역할 자막 문장 수 (배치 크기)
+  batch_size: 10
+  # 이전 대사 문맥 유지를 위해 참조할 직전 문장 수 (슬라이딩 윈도우)
+  context_size: 5
+  temperature: 0.2
+  timeout_sec: 180
+  # 영화의 장르나 추가 배경지식 힌트 (비워두면 일반 영화 모드로 동작)
+  movie_context: ""
+
+subtitle:
+  target_language: "한국어"
+  # true로 설정 시 한국어 번역문 아래에 외국어 원문을 함께 표시
+  bilingual: false
+  # 출력 포맷: ["srt"], ["ass"], 또는 ["srt", "ass"]
+  formats:
+    - "srt"
+    - "ass"
+  # 원문 자막(.orig.srt)도 함께 보관할지 여부
+  save_original_srt: true

@@ -1,0 +1,17 @@
+# Python virtual environment & bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Generated subtitle / audio temporary files
+*.wav
+*.srt
+*.ass
+
+# IDE & OS files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

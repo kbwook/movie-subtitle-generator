@@ -1,0 +1,176 @@
+r"""로컬 AI 영화 자막 생성기 CLI 및 GUI 통합 진입점.
+
+사용 예시:
+1. 데스크톱 GUI 실행 (인자 없이 실행하거나 --gui 옵션):
+   .\.venv\Scripts\python.exe main.py --gui
+
+2. 단일 영화 파일 자막 생성 (자동 언어 감지 -> Qwen2.5 한국어 번역):
+   .\.venv\Scripts\python.exe main.py "D:\Movies\sample_movie.mkv"
+
+3. 특정 언어(중국어/일본어/영어) 및 이중 자막(한글+원문) 지정:
+   .\.venv\Scripts\python.exe main.py "D:\Movies\jp_movie.mp4" --lang ja --bilingual
+
+4. 고품질 14B 모델 사용:
+   .\.venv\Scripts\python.exe main.py "D:\Movies\cn_movie.mkv" --lang zh --llm-model qwen2.5:14b
+
+5. 영화 파일 내 오디오 트랙 목록 확인:
+   .\.venv\Scripts\python.exe main.py "D:\Movies\multi_audio.mkv" --list-tracks
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+from pipeline.extractor import list_audio_tracks
+from pipeline.runner import collect_video_files, load_config, process_video_file
+from pipeline.translator import LocalLLMTranslator
+
+
+def setup_logging() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="다양한 코덱의 중·일·영 영화 파일로부터 한국어 자막(.srt/.ass)을 생성합니다."
+    )
+    parser.add_argument(
+        "target",
+        nargs="?",
+        help="자막을 생성할 영화 파일 경로 또는 영화 폴더 경로 (생략 시 GUI 실행)",
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="데스크톱 그래픽 인터페이스(GUI)를 실행합니다.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path(__file__).resolve().parent / "config.yaml",
+        help="설정 파일 경로 (기본값: config.yaml)",
+    )
+    parser.add_argument(
+        "--lang",
+        choices=["auto", "zh", "ja", "en"],
+        default=None,
+        help="원본 영화 음성 언어 (auto: 자동 감지, zh: 중국어, ja: 일본어, en: 영어)",
+    )
+    parser.add_argument(
+        "--whisper-model",
+        default=None,
+        help="Faster-Whisper 모델 크기 (예: large-v3-turbo, large-v3, medium)",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        help="Ollama 로컬 LLM 모델 태그 (예: qwen2.5:7b, qwen2.5:14b)",
+    )
+    parser.add_argument(
+        "--track",
+        type=int,
+        default=None,
+        help="추출할 오디오 트랙 번호 (0부터 시작, --list-tracks로 확인 가능)",
+    )
+    parser.add_argument(
+        "--list-tracks",
+        action="store_true",
+        help="영상 파일 내 오디오 트랙(코덱/언어) 목록만 출력하고 종료합니다.",
+    )
+    parser.add_argument(
+        "--bilingual",
+        action="store_true",
+        help="한국어 번역문과 외국어 원문을 동시에 표시하는 이중 자막을 생성합니다.",
+    )
+    parser.add_argument(
+        "--no-translate",
+        action="store_true",
+        help="LLM 번역을 건너뛰고 원문 자막(STT)만 생성합니다.",
+    )
+    parser.add_argument(
+        "--check-env",
+        action="store_true",
+        help="현재 노트북의 파이프라인 준비 상태 및 로컬 LLM 연결 상태를 점검합니다.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    setup_logging()
+    args = parse_args()
+
+    config = load_config(args.config)
+
+    if args.lang:
+        config["stt"]["language"] = args.lang
+    if args.whisper_model:
+        config["stt"]["model_size"] = args.whisper_model
+    if args.llm_model:
+        config["llm"]["model"] = args.llm_model
+    if args.bilingual:
+        config["subtitle"]["bilingual"] = True
+
+    if args.check_env:
+        print("=== 로컬 AI 영화 자막 생성기 환경 점검 ===")
+        print(f"- STT 모델 설정: {config['stt']['model_size']} (threads={config['stt']['cpu_threads']}, compute={config['stt']['compute_type']})")
+        translator = LocalLLMTranslator(config.get("llm", {}))
+        ok, msg = translator.check_server_and_model()
+        print(f"- LLM 상태: {'[정상]' if ok else '[조치 필요]'} {msg}")
+        return 0
+
+    # 인자 없이 실행하거나 --gui 플래그가 주어지면 GUI 실행
+    if args.gui or not args.target:
+        from gui import launch_gui
+        launch_gui()
+        return 0
+
+    target_path = Path(args.target).resolve()
+    if args.list_tracks:
+        tracks = list_audio_tracks(target_path)
+        print(f"=== 오디오 트랙 목록: {target_path.name} (총 {len(tracks)}개) ===")
+        for t in tracks:
+            print(" ", t.display_label())
+        return 0
+
+    video_files = collect_video_files(target_path)
+    if not video_files:
+        logging.error("처리할 동영상 파일이 없습니다: %s", target_path)
+        return 1
+
+    logging.info("총 %d개의 영화 파일을 처리합니다.", len(video_files))
+
+    def cli_status(stage: str, pct: float, detail: str) -> None:
+        if pct in (0.0, 100.0) or int(pct) % 20 == 0:
+            print(f"[{stage} | {pct:5.1f}%] {detail}")
+
+    for idx, video_file in enumerate(video_files, start=1):
+        print("\n" + "=" * 70)
+        print(f"[{idx}/{len(video_files)}] 영화 처리 시작: {video_file.name}")
+        print("=" * 70)
+        out_files = process_video_file(
+            video_path=video_file,
+            config=config,
+            track_index=args.track,
+            skip_translation=args.no_translate,
+            status_callback=cli_status,
+        )
+        print("-> 생성된 자막 파일:")
+        for f in out_files:
+            print(f"   * {f}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
