@@ -864,6 +864,8 @@ class SubtitleGeneratorGUI:
                             self.queue_items[iid].status = status_text
                             self.root.after(0, self._refresh_tree_numbers)
 
+                    last_ui_time = [0.0]
+
                     def status_cb(
                         stage: str,
                         pct: float,
@@ -871,6 +873,13 @@ class SubtitleGeneratorGUI:
                         job_idx: int = idx,
                         iid: str = item_id,
                     ) -> None:
+                        import time as _time
+                        now = _time.perf_counter()
+                        is_boundary = pct in (0.0, 100.0) or "완료" in stage
+                        if not is_boundary and (now - last_ui_time[0]) < 0.15:
+                            return
+                        last_ui_time[0] = now
+
                         overall_pct = ((job_idx - 1) + (pct / 100.0)) / total_jobs * 100.0
 
                         def _ui():
@@ -884,7 +893,7 @@ class SubtitleGeneratorGUI:
 
                         self.root.after(0, _ui)
                         update_item_status(f"{stage} ({pct:.0f}%)", iid)
-                        if pct in (0.0, 100.0) or "완료" in stage:
+                        if is_boundary:
                             self._append_log(f"[{q_item.video_path.name} | {stage}] {detail}")
 
                     ws = MovieWorkspace(q_item.video_path, output_dir)

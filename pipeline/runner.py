@@ -27,6 +27,7 @@ import yaml
 from pipeline.extractor import (
     SUPPORTED_VIDEO_EXTENSIONS,
     extract_audio_to_wav,
+    get_ffmpeg_binary,
     inspect_video_metadata,
     select_best_audio_track,
 )
@@ -171,7 +172,7 @@ def process_video_file(
                 f"[중간 생산물 재사용] {work_dir.name}/{wav_path.name} ({selected_track.display_label()})",
             )
     else:
-        ext_backend = "System FFmpeg CLI" if shutil.which("ffmpeg") else "PyAV (내장 FFmpeg C-API)"
+        ext_backend = "Native FFmpeg C CLI" if get_ffmpeg_binary() else "PyAV (내장 FFmpeg C-API)"
         if status_callback:
             status_callback(
                 "1/4 오디오 추출",
