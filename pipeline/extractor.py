@@ -174,6 +174,7 @@ def extract_audio_to_wav(
                 ffmpeg_bin,
                 "-y",
                 "-nostdin",
+                "-loglevel", "error",
                 "-threads", "0",
                 "-i", str(video_path),
                 "-map", f"0:a:{selected_track.index}",
@@ -188,7 +189,7 @@ def extract_audio_to_wav(
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 creationflags=creationflags,
             )
             expected_bytes = max(1.0, duration_sec * 16000 * 2) if duration_sec > 0 else 0.0
