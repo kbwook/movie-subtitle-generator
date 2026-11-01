@@ -228,7 +228,7 @@ class PipelineTest(unittest.TestCase):
             # 1단계: 오디오 추출 및 메타 저장 검증
             out_wav, track = extract_audio_to_wav(mkv_path, ws.wav_path, preferred_language="ja")
             ws.save_audio_meta(track)
-            self.assertTrue(ws.has_valid_audio(track_index=0))
+            self.assertTrue(ws.has_valid_audio(expected_track_index=0))
             self.assertEqual(ws.inspect_resume_status(), "이어하기 (1/4 오디오 추출됨)")
 
             # 2단계: STT 세그먼트 저장 및 복원 검증
