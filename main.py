@@ -89,7 +89,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--whisper-model",
         default=None,
-        help="Faster-Whisper 모델 크기 (예: large-v3-turbo, large-v3, medium)",
+        help="Whisper 모델 크기 (예: large-v3-turbo, large-v3, medium, small, base, tiny)",
+    )
+    parser.add_argument(
+        "--stt-device",
+        choices=["GPU", "NPU", "CPU", "CPU-OV"],
+        default=None,
+        help="STT 연산 가속 장치 (GPU: Intel Arc, NPU: Intel AI Boost, CPU: Faster-Whisper, CPU-OV: OpenVINO CPU)",
     )
     parser.add_argument(
         "--llm-model",
@@ -140,6 +146,8 @@ def main() -> int:
         config["stt"]["language"] = args.lang
     if args.whisper_model:
         config["stt"]["model_size"] = args.whisper_model
+    if args.stt_device:
+        config["stt"]["device"] = args.stt_device
     if args.llm_model:
         config["llm"]["model"] = args.llm_model
     if args.bilingual:
@@ -151,9 +159,9 @@ def main() -> int:
         print(f"- CPU: {hw.cpu_name} ({hw.logical_cores} 논리 코어)")
         print(f"- GPU: {', '.join(hw.gpus) or '감지 안 됨'}")
         print(f"- NPU: {', '.join(hw.npus) or '감지 안 됨'}")
+        print(f"- OpenVINO 가속기: {', '.join(hw.openvino_devices) or '미감지'}")
         print(f"- RAM: 가용 {hw.avail_ram_gb:.1f} GB / 전체 {hw.total_ram_gb:.1f} GB")
-        print(f"- ONNX 프로바이더: {', '.join(hw.onnx_providers)}")
-        print(f"- STT 모델 설정: {config['stt']['model_size']} (device={config['stt'].get('device', 'cpu')}, threads={config['stt']['cpu_threads']}, compute={config['stt']['compute_type']})")
+        print(f"- STT 모델 설정: {config['stt']['model_size']} (device={config['stt'].get('device', 'GPU')}, threads={config['stt']['cpu_threads']}, compute={config['stt']['compute_type']})")
         translator = LocalLLMTranslator(config.get("llm", {}))
         ok, msg = translator.check_server_and_model()
         print(f"- LLM 상태: {'[정상]' if ok else '[조치 필요]'} {msg}")

@@ -214,22 +214,34 @@ class SubtitleGeneratorGUI:
             stt_frame,
             textvariable=self.whisper_var,
             state="readonly",
-            values=["large-v3-turbo", "large-v3", "medium", "small"],
+            values=["large-v3-turbo", "large-v3", "medium", "small", "base", "tiny"],
             width=16,
         ).grid(row=0, column=3, sticky="w", padx=6, pady=5)
 
-        ttk.Label(stt_frame, text="CPU 스레드:").grid(row=1, column=0, sticky="w", padx=8, pady=5)
-        self.threads_var = tk.IntVar(value=int(self.config["stt"].get("cpu_threads", 12)))
-        ttk.Spinbox(stt_frame, from_=2, to=22, textvariable=self.threads_var, width=8).grid(
-            row=1, column=1, sticky="w", padx=6, pady=5
-        )
+        ttk.Label(stt_frame, text="STT 가속 장치:").grid(row=1, column=0, sticky="w", padx=8, pady=5)
+        init_dev = str(self.config["stt"].get("device", "GPU")).upper()
+        dev_map = {
+            "GPU": "GPU (Intel Arc - OpenVINO)",
+            "NPU": "NPU (Intel AI Boost - OpenVINO)",
+            "CPU": "CPU (Faster-Whisper INT8)",
+            "CPU-OV": "CPU-OV (OpenVINO CPU)",
+        }
+        self.stt_device_var = tk.StringVar(value=dev_map.get(init_dev, "GPU (Intel Arc - OpenVINO)"))
+        ttk.Combobox(
+            stt_frame,
+            textvariable=self.stt_device_var,
+            state="readonly",
+            values=list(dev_map.values()),
+            width=24,
+        ).grid(row=1, column=1, sticky="w", padx=6, pady=5)
 
         self.vad_var = tk.BooleanVar(value=bool(self.config["stt"].get("vad_filter", True)))
         ttk.Checkbutton(
             stt_frame,
-            text="Silero VAD 필터 (배경음악 환각 방지)",
+            text="Silero VAD (배경음악 환각 방지)",
             variable=self.vad_var,
         ).grid(row=1, column=2, columnspan=2, sticky="w", padx=8, pady=5)
+        self.threads_var = tk.IntVar(value=int(self.config["stt"].get("cpu_threads", 12)))
 
         # 자막 포맷 체크박스들
         fmt_list = self.config["subtitle"].get("formats", ["srt", "ass"])
@@ -433,7 +445,9 @@ class SubtitleGeneratorGUI:
 
     def _sync_ui_to_config(self) -> Dict:
         lang_code = self.global_lang_var.get().split()[0]
+        stt_dev_code = self.stt_device_var.get().split()[0]
         self.config["stt"]["language"] = lang_code
+        self.config["stt"]["device"] = stt_dev_code
         self.config["stt"]["model_size"] = self.whisper_var.get().strip()
         self.config["stt"]["cpu_threads"] = int(self.threads_var.get())
         self.config["stt"]["vad_filter"] = bool(self.vad_var.get())

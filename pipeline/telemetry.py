@@ -38,6 +38,7 @@ class HardwareInventory:
     avail_ram_gb: float = 0.0
     gpus: List[str] = field(default_factory=list)
     npus: List[str] = field(default_factory=list)
+    openvino_devices: List[str] = field(default_factory=list)
     onnx_providers: List[str] = field(default_factory=list)
 
 
@@ -81,7 +82,8 @@ class JobTelemetryReport:
             f" • 감지된 하드웨어:",
             f"   - CPU : {self.hardware.cpu_name} ({self.hardware.logical_cores} 논리 코어)",
             f"   - GPU : {', '.join(self.hardware.gpus) if self.hardware.gpus else '감지 안 됨'}",
-            f"   - NPU : {', '.join(self.hardware.npus) if self.hardware.npus else 'Intel AI Boost (드라이버/백엔드 미연결)'}",
+            f"   - NPU : {', '.join(self.hardware.npus) if self.hardware.npus else '감지 안 됨'}",
+            f"   - OpenVINO 가속기: {', '.join(self.hardware.openvino_devices) if self.hardware.openvino_devices else '미설치'}",
             f"   - RAM : 가용 {self.hardware.avail_ram_gb:.1f} GB / 전체 {self.hardware.total_ram_gb:.1f} GB",
             "------------------------------------------------------------------------",
             " [단계별 사용 연산 장치(CPU/GPU/NPU) 및 소요 시간]",
@@ -173,9 +175,23 @@ def detect_hardware_inventory() -> HardwareInventory:
         if desc and desc not in inv.gpus:
             inv.gpus.append(desc)
 
-    # Intel Core Ultra (Meteor Lake / Lunar Lake) 내장 NPU 존재 여부 확인
-    if "Ultra" in inv.cpu_name:
-        inv.npus.append("Intel(R) AI Boost NPU (Core Ultra 내장)")
+    # OpenVINO 런타임에서 실제 사용 가능한 CPU / GPU / NPU 디바이스 조회
+    try:
+        import openvino as ov
+        core = ov.Core()
+        for dev in core.available_devices:
+            try:
+                full_name = core.get_property(dev, "FULL_DEVICE_NAME")
+            except Exception:
+                full_name = dev
+            inv.openvino_devices.append(f"{dev} ({full_name})")
+            if dev.startswith("GPU") and full_name not in inv.gpus:
+                inv.gpus.append(full_name)
+            elif dev.startswith("NPU") and full_name not in inv.npus:
+                inv.npus.append(full_name)
+    except Exception:
+        if "Ultra" in inv.cpu_name and not inv.npus:
+            inv.npus.append("Intel(R) AI Boost NPU")
 
     try:
         inv.onnx_providers = list(ort.get_available_providers())

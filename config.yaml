@@ -1,14 +1,18 @@
-# 로컬 영화 자막 생성기 설정 (Intel Core Ultra 7 155H + Intel Arc + 32GB RAM 최적화)
+# 로컬 영화 자막 생성기 설정 (Intel Core Ultra 7 155H + Intel Arc GPU + Intel AI Boost NPU + 32GB RAM 최적화)
 
 stt:
-  # 추천 모델: "large-v3-turbo" (속도/품질 최적), "large-v3" (최고 정확도), "medium" (저사양용)
+  # 추천 모델: "large-v3-turbo" (속도/품질 최적), "large-v3" (최고 정확도), "medium", "small"
   model_size: "large-v3-turbo"
-  # 실행 장치: faster-whisper 기준 Intel 환경에서는 "cpu" + int8 멀티스레드가 가장 안정적이며 빠름
-  device: "cpu"
+  # STT 연산 장치 선택:
+  # - "GPU"    : Intel Arc 내장 그래픽 가속 (OpenVINO WhisperPipeline - 강력 추천)
+  # - "NPU"    : Intel AI Boost NPU 신경망 가속기 (OpenVINO WhisperPipeline - 저전력 가속)
+  # - "CPU"    : Faster-Whisper (CTranslate2 INT8 멀티스레드 CPU)
+  # - "CPU-OV" : OpenVINO CPU 모드
+  device: "GPU"
   compute_type: "int8"
-  # Intel Core Ultra 7 155H (16코어 22스레드) 최적 스레드 수
+  # CPU 모드 사용 시 스레드 수 (Ultra 7 155H: 12 권장)
   cpu_threads: 12
-  # 원본 음성 언어 ("auto": 자동 감지, "zh": 중국어, "ja": 일본어, "en": 영어)
+  # 원본 음성 언어 ("auto": 자동 감지, "zh": 중국어, "ja": 일본어, "en": 영어, "fr": 프랑스어)
   language: "auto"
   beam_size: 5
   # 영화 배경음악(BGM) 및 무음 구간에서 발생하는 환각(Hallucination) 방지용 Silero VAD 설정

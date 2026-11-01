@@ -265,6 +265,25 @@ class PipelineTest(unittest.TestCase):
                     cancel_event=cancel_ev,
                 )
 
+    def test_08_openvino_speech_windows_and_gpu_npu_discovery(self) -> None:
+        """OpenVINO GPU/NPU 장치 탐색 및 Silero VAD 슬라이딩 윈도우 분할을 검증합니다."""
+        import numpy as np
+        from pipeline.telemetry import detect_hardware_inventory
+        from pipeline.transcriber import _build_speech_windows
+
+        hw = detect_hardware_inventory()
+        self.assertTrue(len(hw.openvino_devices) >= 1)
+        self.assertTrue(any("GPU" in d or "NPU" in d or "CPU" in d for d in hw.openvino_devices))
+
+        # 45초 길이의 더미 파형으로 28초 이하 윈도우(샘플 인덱스 쌍) 분할 테스트
+        sr = 16000
+        dummy_audio = np.zeros(sr * 45, dtype=np.float32)
+        windows = _build_speech_windows(dummy_audio, vad_filter=False, vad_parameters={}, max_window_sec=28.0)
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(windows[0][0], 0)
+        self.assertLessEqual(windows[0][1] - windows[0][0], int(28.0 * sr))
+        self.assertEqual(windows[1][1], sr * 45)
+
 
 if __name__ == "__main__":
     unittest.main()

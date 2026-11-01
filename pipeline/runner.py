@@ -253,18 +253,22 @@ def process_video_file(
             except Exception:
                 partial_segments = None
 
-        stt_dev = stt_cfg.get("device", "cpu").upper()
+        stt_dev = stt_cfg.get("device", "GPU").upper()
         stt_threads = stt_cfg.get("cpu_threads", 12)
         stt_compute = stt_cfg.get("compute_type", "int8")
         resume_msg = (
             f" (기존 {len(partial_segments)}문장 이후부터 이어하기)"
             if partial_segments else ""
         )
+        if stt_dev in ("GPU", "NPU", "CPU-OV", "OPENVINO-CPU"):
+            dev_desc = f"OpenVINO {stt_dev} 가속"
+        else:
+            dev_desc = f"{stt_dev} ({stt_compute}, {stt_threads}스레드)"
         if status_callback:
             status_callback(
                 "2/4 음성 인식 (STT)",
                 0.0,
-                f"[장치: {stt_dev} ({stt_compute}, {stt_threads}스레드)] Whisper ({stt_cfg.get('model_size', 'large-v3-turbo')}) 시작{resume_msg}...",
+                f"[장치: {dev_desc}] Whisper ({stt_cfg.get('model_size', 'large-v3-turbo')}) 시작{resume_msg}...",
             )
 
         stt_telemetry: Dict[str, Any] = {}
@@ -424,12 +428,17 @@ def process_video_file(
 
     opt_notes: List[str] = []
     for sm in stage_metrics:
-        if sm.stage_name == "2/4 음성 인식 (STT)" and sm.accelerator_type == "CPU":
-            opt_notes.append(
-                "STT(음성 인식) 단계가 현재 CTranslate2 CPU(INT8)로 동작했습니다. "
-                "Intel Arc GPU(Vulkan `whisper.cpp`) 또는 Intel NPU/iGPU(`OpenVINO Whisper`) 백엔드로 전환 시 "
-                "CPU 점유율을 낮추고 STT 속도를 약 2~3배 단축할 수 있습니다."
-            )
+        if sm.stage_name == "2/4 음성 인식 (STT)":
+            if sm.accelerator_type == "CPU":
+                opt_notes.append(
+                    "STT(음성 인식) 단계가 CPU로 동작했습니다. "
+                    "GUI [STT 가속 장치]에서 `GPU (Intel Arc - OpenVINO)` 또는 `NPU (Intel AI Boost - OpenVINO)`를 선택하면 "
+                    "CPU 점유율을 낮추고 하드웨어 가속을 활용할 수 있습니다."
+                )
+            elif "GPU" in sm.accelerator_type or "NPU" in sm.accelerator_type:
+                opt_notes.append(
+                    f"STT(음성 인식) 단계에서 {sm.accelerator_type} ({sm.backend_detail}) 하드웨어 가속이 정상 동작했습니다."
+                )
         if sm.stage_name == "3/4 로컬 LLM 번역" and sm.accelerator_type != "Cache (재사용)":
             gpu_pct = sm.extra_metrics.get("gpu_offload_pct", 0.0)
             if gpu_pct == 0.0:
