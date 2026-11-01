@@ -1,29 +1,23 @@
-# PowerShell 5.1 호환 바탕화면 및 시작 메뉴 바로가기(.lnk) 생성 스크립트
 $ErrorActionPreference = "Stop"
 $projectDir = $PSScriptRoot
-& "$projectDir\.venv\Scripts\python.exe" -c "
-import subprocess, os
-from pathlib import Path
+$pythonwPath = Join-Path $projectDir ".venv\Scripts\pythonw.exe"
+if (-not (Test-Path $pythonwPath)) {
+    $pythonwPath = Join-Path $projectDir ".venv\Scripts\python.exe"
+}
+$mainPyPath = Join-Path $projectDir "main.py"
 
-project_dir = Path(r'$projectDir').resolve()
-pythonw = project_dir / '.venv' / 'Scripts' / 'pythonw.exe'
-if not pythonw.exists():
-    pythonw = project_dir / '.venv' / 'Scripts' / 'python.exe'
-main_py = project_dir / 'main.py'
+# "로컬 AI 영화 자막 생성기.lnk" in Unicode codepoints (ASCII-safe for PowerShell 5.1)
+$shortcutName = "$([char]0xB85C)$([char]0xCEEC) AI $([char]0xC601)$([char]0xD654) $([char]0xC790)$([char]0xB9C9) $([char]0xC0DD)$([char]0xC131)$([char]0xAE30).lnk"
 
-ps_code = f'''
-`$WshShell = New-Object -ComObject WScript.Shell
-foreach (`$folder in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'))) {{
-    `$lnk = Join-Path `$folder '로컬 AI 영화 자막 생성기.lnk'
-    `$sc = `$WshShell.CreateShortcut(`$lnk)
-    `$sc.TargetPath = '{pythonw}'
-    `$sc.Arguments = '\"{main_py}\" --gui'
-    `$sc.WorkingDirectory = '{project_dir}'
-    `$sc.Description = '로컬 AI 다국어 영화 자막 생성기'
-    `$sc.IconLocation = \"`$env:SystemRoot\\System32\\shell32.dll,115\"
-    `$sc.Save()
-    Write-Output \"Created: `$lnk\"
-}}
-'''
-subprocess.run(['powershell', '-NoProfile', '-Command', ps_code], check=True)
-"
+$WshShell = New-Object -ComObject WScript.Shell
+
+foreach ($folder in @([Environment]::GetFolderPath("Desktop"), [Environment]::GetFolderPath("Programs"))) {
+    $lnkPath = Join-Path $folder $shortcutName
+    $sc = $WshShell.CreateShortcut($lnkPath)
+    $sc.TargetPath = $pythonwPath
+    $sc.Arguments = "`"$mainPyPath`" --gui"
+    $sc.WorkingDirectory = $projectDir
+    $sc.IconLocation = "$env:SystemRoot\System32\shell32.dll,115"
+    $sc.Save()
+    Write-Host "Shortcut created: $lnkPath" -ForegroundColor Green
+}
