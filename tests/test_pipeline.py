@@ -27,6 +27,7 @@ from pipeline.telemetry import (
 )
 from pipeline.transcriber import load_wav_as_float32
 from pipeline.translator import LocalLLMTranslator
+from pipeline.workspace import JobCancelledError, MovieWorkspace
 
 
 def _create_dummy_mkv_with_multi_audio(path: Path) -> None:
@@ -213,6 +214,56 @@ class PipelineTest(unittest.TestCase):
             content = txt_path.read_text(encoding="utf-8")
             self.assertIn("성능 및 하드웨어 가속 리포트", content)
             self.assertIn("Faster-Whisper INT8", content)
+
+    def test_workspace_intermediate_artifacts_and_cancel(self) -> None:
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mkv_path = Path(tmp) / "sample_film.mkv"
+            _create_dummy_mkv_with_multi_audio(mkv_path)
+
+            ws = MovieWorkspace(mkv_path)
+            self.assertEqual(ws.inspect_resume_status(), "대기 중 (새 작업)")
+
+            # 1단계: 오디오 추출 및 메타 저장 검증
+            out_wav, track = extract_audio_to_wav(mkv_path, ws.wav_path, preferred_language="ja")
+            ws.save_audio_meta(track)
+            self.assertTrue(ws.has_valid_audio(track_index=0))
+            self.assertEqual(ws.inspect_resume_status(), "이어하기 (1/4 오디오 추출됨)")
+
+            # 2단계: STT 세그먼트 저장 및 복원 검증
+            segs = [
+                SubtitleSegment(1, 0.0, 2.0, "Bonjour"),
+                SubtitleSegment(2, 2.5, 4.5, "Comment ça va?"),
+            ]
+            ws.save_stt_segments(segs, "fr", partial=False)
+            self.assertTrue(ws.has_valid_stt())
+            self.assertIn("2/4 STT 완료: 2문장", ws.inspect_resume_status())
+
+            loaded_segs, lang = ws.load_stt_segments()
+            self.assertEqual(lang, "fr")
+            self.assertEqual(len(loaded_segs), 2)
+
+            # 3단계: 부분 번역 체크포인트 저장 및 이어하기 병합 검증
+            loaded_segs[0].translated_text = "안녕하세요"
+            ws.save_translation_checkpoint(loaded_segs, "fr", "한국어", "qwen2.5:7b")
+            self.assertEqual(ws.inspect_resume_status(), "이어하기 (번역 1/2)")
+
+            fresh_segs, _ = ws.load_stt_segments()
+            merged_segs, restored_cnt = ws.merge_translation_checkpoint(fresh_segs)
+            self.assertEqual(restored_cnt, 1)
+            self.assertEqual(merged_segs[0].translated_text, "안녕하세요")
+            self.assertIsNone(merged_segs[1].translated_text)
+
+            # 즉시 중단(cancel_event) 동작 검증
+            cancel_ev = threading.Event()
+            cancel_ev.set()
+            with self.assertRaises(JobCancelledError):
+                extract_audio_to_wav(
+                    mkv_path,
+                    Path(tmp) / "aborted.wav",
+                    cancel_event=cancel_ev,
+                )
 
 
 if __name__ == "__main__":

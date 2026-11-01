@@ -3,10 +3,10 @@
 특징:
 1. 문장 1개씩 번역할 때 발생하는 문맥 단절, 반말/존댓말 불일치, 대명사 오역을 방지하기 위해
    직전 N개 대사(문맥 참조용) + 현재 번역할 M개 대사 묶음을 JSON 스키마로 전달합니다.
-2. 타임스탬프 ID가 밀리거나 누락되지 않도록 ID 매핑 검증을 수행하며,
-   혹시 LLM이 일부 문장을 누락한 경우 해당 문장만 개별 재번역(Fallback)하여 100% 싱크를 보장합니다.
-3. Ollama `/api/ps` 및 응답 메타데이터(`eval_count`, `eval_duration`, `load_duration`)를 분석하여
-   실제 사용된 연산 장치(CPU vs Intel Arc GPU Vulkan 오프로딩 비율)와 초당 토큰 속도(t/s)를 로깅합니다.
+2. 배치 완료 시마다 작업 폴더(`translation_checkpoint.json`)에 즉시 체크포인트를 저장하며,
+   재실행 시 이미 번역된 문장은 자동으로 건너뛰고 미번역 배치부터 이어서 번역합니다.
+3. 스트리밍 수신 중 `cancel_event`를 실시간 감지하여 사용자가 [즉시 중단] 클릭 시 0.1초 이내에 즉시 중단합니다.
+4. Ollama `/api/ps` 및 응답 메타데이터를 분석하여 실제 사용된 연산 장치(CPU vs GPU)와 초당 토큰 속도(t/s)를 로깅합니다.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -25,6 +26,7 @@ import requests
 
 from pipeline.models import SubtitleSegment
 from pipeline.telemetry import query_ollama_processor_status
+from pipeline.workspace import JobCancelledError
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +43,7 @@ LANG_KO_NAMES = {
 
 
 class LocalLLMTranslator:
-    """Ollama 로컬 API를 이용한 영화 자막 전문 번역기 (하드웨어 가속 및 타이밍 텔레메트리 내장)."""
+    """Ollama 로컬 API를 이용한 영화 자막 전문 번역기 (즉시 중단, 배치 체크포인트 이어하기, 텔레메트리 내장)."""
 
     def __init__(self, llm_config: Dict):
         self.base_url = llm_config.get("base_url", "http://localhost:11434").rstrip("/")
@@ -133,8 +135,10 @@ class LocalLLMTranslator:
         source_lang: str,
         target_lang: str = "한국어",
         progress_callback: Optional[Callable[[float, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+        checkpoint_callback: Optional[Callable[[List[SubtitleSegment]], None]] = None,
     ) -> List[SubtitleSegment]:
-        """전체 자막 세그먼트를 슬라이딩 윈도우 배치 방식으로 한국어 번역하고 하드웨어/시간 지표를 수집합니다."""
+        """전체 자막 세그먼트를 슬라이딩 윈도우 배치 방식으로 한국어 번역하고 체크포인트 및 텔레메트리를 기록합니다."""
         total = len(segments)
         if total == 0:
             return segments
@@ -146,18 +150,39 @@ class LocalLLMTranslator:
         total_eval_tokens = 0
         total_eval_ns = 0
         batches_count = 0
+        skipped_batches = 0
         fallback_count = 0
         ps_info: Dict[str, Any] = {}
 
         src_lang_name = LANG_KO_NAMES.get(source_lang, source_lang)
+        already_done = sum(1 for s in segments if s.translated_text)
         logger.info(
-            "로컬 LLM 자막 번역 시작: 모델=%s, 원문=%s -> %s, 총 %d개 세그먼트 (배치=%d, 문맥=%d)",
-            self.model, src_lang_name, target_lang, total, self.batch_size, self.context_size,
+            "로컬 LLM 자막 번역 시작: 모델=%s, 원문=%s -> %s, 총 %d개 세그먼트 (기존 완료=%d, 배치=%d, 문맥=%d)",
+            self.model, src_lang_name, target_lang, total, already_done, self.batch_size, self.context_size,
         )
 
         for start_idx in range(0, total, self.batch_size):
+            if cancel_event and cancel_event.is_set():
+                if checkpoint_callback:
+                    checkpoint_callback(segments)
+                done_now = sum(1 for s in segments if s.translated_text)
+                raise JobCancelledError(
+                    f"LLM 번역 중 사용자에 의해 작업이 즉시 중단되었습니다 ({done_now}/{total}문장 번역 저장됨)."
+                )
+
             end_idx = min(start_idx + self.batch_size, total)
             current_batch = segments[start_idx:end_idx]
+
+            # 이미 이전 실행에서 번역 완료된 배치는 건너뛰기 (Resume)
+            if all(bool(seg.translated_text) for seg in current_batch):
+                skipped_batches += 1
+                if progress_callback:
+                    pct = (end_idx / total) * 100.0
+                    progress_callback(
+                        pct,
+                        f"[{end_idx}/{total} | 중간 생산물 복원] {current_batch[-1].translated_text[:32]}",
+                    )
+                continue
 
             ctx_start = max(0, start_idx - self.context_size)
             context_segments = segments[ctx_start:start_idx]
@@ -167,6 +192,7 @@ class LocalLLMTranslator:
                 context_segments,
                 src_lang_name,
                 target_lang,
+                cancel_event=cancel_event,
             )
             batches_count += 1
             total_load_ns += stats.get("load_duration", 0)
@@ -175,7 +201,7 @@ class LocalLLMTranslator:
             total_eval_tokens += stats.get("eval_count", 0)
             total_eval_ns += stats.get("eval_duration", 0)
 
-            # 첫 번째 배치가 메모리에 적재된 직후 /api/ps를 조회하여 실제 GPU/CPU 오프로딩 상태 확인
+            # 첫 번째 실제 배치가 메모리에 적재된 직후 /api/ps를 조회하여 실제 GPU/CPU 오프로딩 상태 확인
             if batches_count == 1:
                 ps_info = query_ollama_processor_status(self.base_url, self.model)
                 logger.info(
@@ -185,15 +211,29 @@ class LocalLLMTranslator:
                 )
 
             for seg in current_batch:
+                if seg.translated_text:
+                    continue
+                if cancel_event and cancel_event.is_set():
+                    if checkpoint_callback:
+                        checkpoint_callback(segments)
+                    done_now = sum(1 for s in segments if s.translated_text)
+                    raise JobCancelledError(
+                        f"LLM 번역 중 사용자에 의해 작업이 즉시 중단되었습니다 ({done_now}/{total}문장 번역 저장됨)."
+                    )
+
                 translated = batch_translations.get(seg.id)
                 if not translated:
                     fallback_count += 1
                     translated, fb_stats = self._translate_single_fallback(
-                        seg.original_text, src_lang_name, target_lang
+                        seg.original_text, src_lang_name, target_lang, cancel_event=cancel_event
                     )
                     total_eval_tokens += fb_stats.get("eval_count", 0)
                     total_eval_ns += fb_stats.get("eval_duration", 0)
                 seg.translated_text = translated.strip()
+
+            # 배치 완료 즉시 작업 폴더에 체크포인트 저장
+            if checkpoint_callback:
+                checkpoint_callback(segments)
 
             if progress_callback:
                 pct = (end_idx / total) * 100.0
@@ -241,6 +281,7 @@ class LocalLLMTranslator:
                 "eval_tok_per_sec": round(eval_tok_per_sec, 2),
                 "prompt_tok_per_sec": round(prompt_tok_per_sec, 2),
                 "batches_count": batches_count,
+                "skipped_batches": skipped_batches,
                 "fallback_count": fallback_count,
             },
         }
@@ -253,8 +294,9 @@ class LocalLLMTranslator:
         context_segments: List[SubtitleSegment],
         src_lang_name: str,
         target_lang: str,
+        cancel_event: Optional[threading.Event] = None,
     ) -> tuple[Dict[int, str], Dict[str, int]]:
-        """배치 단위 JSON 구조화 번역을 수행하고 Ollama 타이밍 통계를 함께 반환합니다."""
+        """배치 단위 JSON 구조화 번역을 스트리밍으로 수행하여 즉시 중단(cancel_event)을 지원합니다."""
         context_lines = []
         for c in context_segments:
             context_lines.append(
@@ -290,30 +332,48 @@ class LocalLLMTranslator:
                 {"role": "user", "content": user_prompt},
             ],
             "format": "json",
-            "stream": False,
+            "stream": True,
             "options": {
                 "temperature": self.temperature,
                 "num_ctx": 4096,
             },
         }
 
+        chunks: List[str] = []
+        stats: Dict[str, int] = {}
+
         try:
-            resp = requests.post(
+            with requests.post(
                 f"{self.base_url}/api/chat",
                 json=payload,
                 timeout=self.timeout_sec,
-            )
-            resp.raise_for_status()
-            body = resp.json()
-            content = body.get("message", {}).get("content", "")
-            stats = {
-                "load_duration": int(body.get("load_duration", 0)),
-                "prompt_eval_count": int(body.get("prompt_eval_count", 0)),
-                "prompt_eval_duration": int(body.get("prompt_eval_duration", 0)),
-                "eval_count": int(body.get("eval_count", 0)),
-                "eval_duration": int(body.get("eval_duration", 0)),
-            }
+                stream=True,
+            ) as resp:
+                resp.raise_for_status()
+                for raw_line in resp.iter_lines():
+                    if cancel_event and cancel_event.is_set():
+                        resp.close()
+                        raise JobCancelledError("LLM 배치 번역 중 사용자에 의해 작업이 즉시 중단되었습니다.")
+                    if not raw_line:
+                        continue
+                    part = json.loads(raw_line.decode("utf-8", errors="replace"))
+                    piece = part.get("message", {}).get("content", "")
+                    if piece:
+                        chunks.append(piece)
+                    if part.get("done"):
+                        stats = {
+                            "load_duration": int(part.get("load_duration", 0)),
+                            "prompt_eval_count": int(part.get("prompt_eval_count", 0)),
+                            "prompt_eval_duration": int(part.get("prompt_eval_duration", 0)),
+                            "eval_count": int(part.get("eval_count", 0)),
+                            "eval_duration": int(part.get("eval_duration", 0)),
+                        }
+                        break
+
+            content = "".join(chunks)
             return self._parse_json_response(content), stats
+        except JobCancelledError:
+            raise
         except Exception as exc:
             logger.warning("배치 번역 중 오류 발생 (개별 폴백 번역으로 전환): %s", exc)
             return {}, {}
@@ -359,8 +419,12 @@ class LocalLLMTranslator:
         text: str,
         src_lang_name: str,
         target_lang: str,
+        cancel_event: Optional[threading.Event] = None,
     ) -> tuple[str, Dict[str, int]]:
         """배치 JSON에서 누락된 단일 문장을 개별 번역합니다."""
+        if cancel_event and cancel_event.is_set():
+            raise JobCancelledError("단일 문장 번역 중 작업이 중단되었습니다.")
+
         payload = {
             "model": self.model,
             "messages": [

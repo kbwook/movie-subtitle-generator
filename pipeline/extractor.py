@@ -2,7 +2,8 @@
 
 내장 PyAV(FFmpeg C 라이브러리 바인딩)를 기본 사용하여 시스템에 별도 FFmpeg가 설치되어 있지 않아도
 MKV, MP4, AVI, TS, MOV 등의 컨테이너와 AAC, AC3, E-AC3, DTS, FLAC, MP3, Opus 등
-거의 모든 오디오 코덱을 디코딩합니다. 시스템 FFmpeg가 있으면 고속 CLI 경로도 지원합니다.
+거의 모든 오디오 코덱을 디코딩합니다.
+작업 중 `cancel_event`가 설정되면 즉시 디코딩을 중단하고 임시 파일을 정리합니다.
 """
 
 from __future__ import annotations
@@ -10,6 +11,8 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import threading
+import time
 import wave
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -18,6 +21,7 @@ import av
 import numpy as np
 
 from pipeline.models import AudioTrackInfo, VideoMediaInfo
+from pipeline.workspace import JobCancelledError
 
 logger = logging.getLogger(__name__)
 
@@ -129,15 +133,20 @@ def extract_audio_to_wav(
     preferred_language: str = "auto",
     track_index: Optional[int] = None,
     progress_callback: Optional[Callable[[float], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> tuple[Path, AudioTrackInfo]:
-    """선택된 오디오 트랙을 Whisper 최적 포맷(16kHz, Mono, 16-bit PCM WAV)으로 추출합니다."""
+    """선택된 오디오 트랙을 Whisper 최적 포맷(16kHz, Mono, 16-bit PCM WAV)으로 원자적 추출합니다."""
     video_path = Path(video_path)
     output_wav_path = Path(output_wav_path)
     output_wav_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_wav_path = output_wav_path.with_suffix(".wav.part")
 
     tracks = list_audio_tracks(video_path)
     selected_track = select_best_audio_track(tracks, preferred_language, track_index)
     logger.info("선택된 오디오 트랙: %s", selected_track.display_label())
+
+    if cancel_event and cancel_event.is_set():
+        raise JobCancelledError("오디오 추출 시작 전 작업이 중단되었습니다.")
 
     # 시스템에 ffmpeg 실행 파일이 있는 경우 고속 서브프로세스 추출 시도
     ffmpeg_bin = shutil.which("ffmpeg")
@@ -152,48 +161,70 @@ def extract_audio_to_wav(
                 "-acodec", "pcm_s16le",
                 "-ar", "16000",
                 "-ac", "1",
-                str(output_wav_path),
+                str(tmp_wav_path),
             ]
-            subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
-            if progress_callback:
-                progress_callback(100.0)
-            return output_wav_path, selected_track
+            while proc.poll() is None:
+                if cancel_event and cancel_event.is_set():
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                    tmp_wav_path.unlink(missing_ok=True)
+                    raise JobCancelledError("오디오 추출 중 사용자에 의해 작업이 즉시 중단되었습니다.")
+                time.sleep(0.15)
+
+            if proc.returncode == 0 and tmp_wav_path.exists():
+                tmp_wav_path.replace(output_wav_path)
+                if progress_callback:
+                    progress_callback(100.0)
+                return output_wav_path, selected_track
+        except JobCancelledError:
+            raise
         except Exception as exc:
             logger.warning("시스템 FFmpeg 호출 실패, 내장 PyAV 디코더로 전환합니다: %s", exc)
 
     # 내장 PyAV 디코더 + 리샘플러 (외부 FFmpeg 설치 불필요)
-    with av.open(str(video_path)) as container:
-        audio_stream = container.streams.audio[selected_track.index]
-        resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+    try:
+        with av.open(str(video_path)) as container:
+            audio_stream = container.streams.audio[selected_track.index]
+            resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
 
-        duration_sec = float(container.duration / av.time_base) if container.duration else 0.0
+            duration_sec = float(container.duration / av.time_base) if container.duration else 0.0
 
-        with wave.open(str(output_wav_path), "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)  # 16-bit = 2 bytes
-            wav_file.setframerate(16000)
+            with wave.open(str(tmp_wav_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)  # 16-bit = 2 bytes
+                wav_file.setframerate(16000)
 
-            for packet in container.demux(audio_stream):
-                for frame in packet.decode():
-                    resampled_frames = resampler.resample(frame)
-                    for r_frame in resampled_frames:
-                        pcm_bytes = r_frame.to_ndarray().astype(np.int16).tobytes()
-                        wav_file.writeframes(pcm_bytes)
+                packet_counter = 0
+                for packet in container.demux(audio_stream):
+                    packet_counter += 1
+                    if packet_counter % 50 == 0 and cancel_event and cancel_event.is_set():
+                        raise JobCancelledError("오디오 추출 중 사용자에 의해 작업이 즉시 중단되었습니다.")
 
-                    if progress_callback and duration_sec > 0 and frame.pts and frame.time_base:
-                        current_sec = float(frame.pts * frame.time_base)
-                        pct = min(100.0, (current_sec / duration_sec) * 100.0)
-                        progress_callback(pct)
+                    for frame in packet.decode():
+                        resampled_frames = resampler.resample(frame)
+                        for r_frame in resampled_frames:
+                            pcm_bytes = r_frame.to_ndarray().astype(np.int16).tobytes()
+                            wav_file.writeframes(pcm_bytes)
 
-            # 남은 리샘플러 버퍼 플러시
-            for r_frame in resampler.resample(None):
-                pcm_bytes = r_frame.to_ndarray().astype(np.int16).tobytes()
-                wav_file.writeframes(pcm_bytes)
+                        if progress_callback and duration_sec > 0 and frame.pts and frame.time_base:
+                            current_sec = float(frame.pts * frame.time_base)
+                            pct = min(100.0, (current_sec / duration_sec) * 100.0)
+                            progress_callback(pct)
+
+                # 남은 리샘플러 버퍼 플러시
+                for r_frame in resampler.resample(None):
+                    pcm_bytes = r_frame.to_ndarray().astype(np.int16).tobytes()
+                    wav_file.writeframes(pcm_bytes)
+
+        tmp_wav_path.replace(output_wav_path)
+    except JobCancelledError:
+        tmp_wav_path.unlink(missing_ok=True)
+        raise
 
     if progress_callback:
         progress_callback(100.0)

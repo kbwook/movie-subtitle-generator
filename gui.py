@@ -1,8 +1,7 @@
-"""로컬 AI 다국어 영화 자막 생성기 - 멀티 파일 대기열(Queue) 관리 및 상세 옵션 GUI."""
+"""로컬 AI 다국어 영화 자막 생성기 - 멀티 파일 대기열(Queue), 작업 폴더 중간 생산물 이어하기 및 즉시 중단 GUI."""
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 import os
 import subprocess
@@ -18,6 +17,7 @@ from pipeline.models import VideoMediaInfo
 from pipeline.runner import collect_video_files, load_config, process_video_file, save_config
 from pipeline.telemetry import detect_hardware_inventory
 from pipeline.translator import LocalLLMTranslator
+from pipeline.workspace import JobCancelledError, MovieWorkspace
 
 
 @dataclass
@@ -29,7 +29,7 @@ class QueueItem:
     track_index: Optional[int] = None      # None이면 자동 선택
     language_override: str = "default"     # "default", "auto", "zh", "ja", "en"
     custom_hint: str = ""                  # 개별 영화 배경 힌트
-    status: str = "대기 중"
+    status: str = "대기 중 (새 작업)"
     generated_files: List[Path] = field(default_factory=list)
 
     def track_lang_label(self) -> str:
@@ -42,8 +42,8 @@ class SubtitleGeneratorGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("로컬 AI 다국어 영화 자막 생성기 (Intel Core Ultra 7 + Arc 최적화)")
-        self.root.geometry("1080x820")
-        self.root.minsize(960, 740)
+        self.root.geometry("1120x840")
+        self.root.minsize(980, 750)
 
         self.config_path = Path(__file__).resolve().parent / "config.yaml"
         self.config = load_config(self.config_path)
@@ -54,6 +54,7 @@ class SubtitleGeneratorGUI:
 
         self.is_running = False
         self.stop_requested = False
+        self.cancel_event = threading.Event()
 
         self._configure_styles()
         self._build_ui()
@@ -66,37 +67,40 @@ class SubtitleGeneratorGUI:
         style.configure("Treeview", rowheight=26, font=("맑은 고딕", 9))
         style.configure("Treeview.Heading", font=("맑은 고딕", 9, "bold"))
         style.configure("Accent.TButton", font=("맑은 고딕", 10, "bold"))
+        style.configure("Danger.TButton", font=("맑은 고딕", 10, "bold"), foreground="#b00020")
 
     def _build_ui(self) -> None:
         pad = {"padx": 10, "pady": 5}
 
         # =====================================================================
-        # 1. 상단: 자막 생성 대상 영화 리스트(Queue) 관리 영역
+        # 1. 상단: 자막 생성 대상 영화 리스트(Queue) 및 작업 폴더 중간 생산물 관리
         # =====================================================================
         queue_frame = ttk.LabelFrame(
             self.root,
-            text="1. 자막 생성 영화 리스트 관리 (다양한 코덱 지원: MKV, MP4, AVI, TS, MOV, WMV 등)",
+            text="1. 자막 생성 영화 리스트 및 작업 폴더(<영화이름>_work) 중간 생산물 관리",
         )
         queue_frame.pack(fill="both", expand=True, **pad)
 
-        # 리스트 상단 툴바 버튼들
         toolbar = ttk.Frame(queue_frame)
         toolbar.pack(fill="x", padx=8, pady=(6, 4))
 
         ttk.Button(toolbar, text="➕ 영화 파일 추가", command=self._on_add_files).pack(side="left", padx=2)
         ttk.Button(toolbar, text="📁 폴더 통째로 추가", command=self._on_add_folder).pack(side="left", padx=2)
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=6, pady=2)
-        ttk.Button(toolbar, text="🔼 위로", width=7, command=lambda: self._on_move_item(-1)).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="🔽 아래로", width=7, command=lambda: self._on_move_item(1)).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="🗑️ 선택 삭제", command=self._on_remove_selected).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="🧹 완료 항목 정리", command=self._on_clear_completed).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="🔼 위로", width=6, command=lambda: self._on_move_item(-1)).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="🔽 아래로", width=6, command=lambda: self._on_move_item(1)).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="🗑️ 선택 제거", command=self._on_remove_selected).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="♻️ 중간생산물 초기화", command=self._on_reset_selected_artifacts).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="🧹 완료 정리", command=self._on_clear_completed).pack(side="left", padx=2)
         ttk.Button(toolbar, text="🔄 전체 비우기", command=self._on_clear_all).pack(side="left", padx=2)
 
-        ttk.Button(toolbar, text="📊 성능 리포트 열기", command=self._on_open_perf_log).pack(side="right", padx=2)
-        ttk.Button(toolbar, text="📂 선택 파일 폴더 열기", command=self._on_open_folder).pack(side="right", padx=2)
+        ttk.Button(toolbar, text="📊 성능 리포트", command=self._on_open_perf_log).pack(side="right", padx=2)
+        ttk.Button(toolbar, text="🗂️ 작업 폴더(_work) 열기", command=self._on_open_work_folder).pack(side="right", padx=2)
+        ttk.Button(toolbar, text="📂 영화 폴더 열기", command=self._on_open_folder).pack(side="right", padx=2)
+
         self.queue_count_var = tk.StringVar(value="등록된 영화: 0편")
         ttk.Label(toolbar, textvariable=self.queue_count_var, font=("맑은 고딕", 9, "bold")).pack(
-            side="right", padx=10
+            side="right", padx=8
         )
 
         # Treeview 테이블
@@ -116,14 +120,14 @@ class SubtitleGeneratorGUI:
         self.tree.heading("video_info", text="비디오 코덱 / 길이 / 용량")
         self.tree.heading("audio_tracks", text="감지된 오디오 트랙 / 코덱")
         self.tree.heading("override", text="적용 트랙 / 언어")
-        self.tree.heading("status", text="진행 상태")
+        self.tree.heading("status", text="진행 상태 / 중간 생산물")
 
-        self.tree.column("no", width=40, anchor="center", stretch=False)
-        self.tree.column("filename", width=260, anchor="w")
-        self.tree.column("video_info", width=185, anchor="center", stretch=False)
-        self.tree.column("audio_tracks", width=250, anchor="w")
-        self.tree.column("override", width=125, anchor="center", stretch=False)
-        self.tree.column("status", width=150, anchor="center", stretch=False)
+        self.tree.column("no", width=38, anchor="center", stretch=False)
+        self.tree.column("filename", width=250, anchor="w")
+        self.tree.column("video_info", width=180, anchor="center", stretch=False)
+        self.tree.column("audio_tracks", width=230, anchor="w")
+        self.tree.column("override", width=120, anchor="center", stretch=False)
+        self.tree.column("status", width=210, anchor="center", stretch=False)
 
         vsb = ttk.Scrollbar(tree_container, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -161,6 +165,7 @@ class SubtitleGeneratorGUI:
                 "zh (중국어)",
                 "ja (일본어)",
                 "en (영어)",
+                "fr (프랑스어)",
             ],
         )
         self.item_lang_combo.pack(side="left", padx=(4, 10))
@@ -176,13 +181,13 @@ class SubtitleGeneratorGUI:
         ).pack(side="left", padx=2)
 
         # =====================================================================
-        # 2. 중단: 음성 인식(STT) / 로컬 LLM 번역 / 자막 포맷 상세 옵션 영역 (탭/그룹)
+        # 2. 중단: 음성 인식(STT) / 로컬 LLM 번역 / 자막 포맷 상세 옵션 영역
         # =====================================================================
         options_container = ttk.Frame(self.root)
         options_container.pack(fill="x", **pad)
 
         # 좌측: 음성 인식(STT) & 자막 출력 옵션
-        stt_frame = ttk.LabelFrame(options_container, text="2. 음성 인식 (STT) 및 자막 출력 옵션")
+        stt_frame = ttk.LabelFrame(options_container, text="2. 음성 인식 (STT) 및 중간 생산물 / 자막 옵션")
         stt_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
 
         ttk.Label(stt_frame, text="기본 원본 언어:").grid(row=0, column=0, sticky="w", padx=8, pady=5)
@@ -192,6 +197,7 @@ class SubtitleGeneratorGUI:
             "zh": "zh (중국어)",
             "ja": "ja (일본어)",
             "en": "en (영어)",
+            "fr": "fr (프랑스어)",
         }
         self.global_lang_var = tk.StringVar(value=lang_map.get(init_lang, "auto (자동 감지)"))
         ttk.Combobox(
@@ -233,33 +239,40 @@ class SubtitleGeneratorGUI:
         self.save_orig_var = tk.BooleanVar(value=bool(self.config["subtitle"].get("save_original_srt", True)))
 
         chk_row = ttk.Frame(stt_frame)
-        chk_row.grid(row=2, column=0, columnspan=4, sticky="w", padx=8, pady=4)
+        chk_row.grid(row=2, column=0, columnspan=4, sticky="w", padx=8, pady=3)
         ttk.Label(chk_row, text="출력 형식:").pack(side="left", padx=(0, 6))
         ttk.Checkbutton(chk_row, text=".srt", variable=self.fmt_srt_var).pack(side="left", padx=4)
         ttk.Checkbutton(chk_row, text=".ass (스타일 자막)", variable=self.fmt_ass_var).pack(side="left", padx=4)
         ttk.Checkbutton(chk_row, text="원문(.orig.srt) 보관", variable=self.save_orig_var).pack(side="left", padx=8)
 
         chk_row2 = ttk.Frame(stt_frame)
-        chk_row2.grid(row=3, column=0, columnspan=4, sticky="w", padx=8, pady=4)
+        chk_row2.grid(row=3, column=0, columnspan=4, sticky="w", padx=8, pady=3)
         ttk.Checkbutton(
             chk_row2,
-            text="한글 + 외국어 원문 동시 표기 (이중 자막)",
+            text="한글+원문 동시 표기(이중 자막)",
             variable=self.bilingual_var,
-        ).pack(side="left", padx=(0, 12))
+        ).pack(side="left", padx=(0, 10))
 
         self.skip_trans_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             chk_row2,
-            text="번역 생략 (원문 STT만 추출)",
+            text="번역 생략(STT만)",
             variable=self.skip_trans_var,
+        ).pack(side="left", padx=(0, 10))
+
+        self.resume_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            chk_row2,
+            text="저장된 중간 생산물 이어하기 사용",
+            variable=self.resume_var,
         ).pack(side="left")
 
         # 저장 폴더 지정
         out_row = ttk.Frame(stt_frame)
         out_row.grid(row=4, column=0, columnspan=4, sticky="we", padx=8, pady=5)
-        ttk.Label(out_row, text="자막 저장 폴더:").pack(side="left")
+        ttk.Label(out_row, text="자막/작업폴더 위치:").pack(side="left")
         self.output_dir_var = tk.StringVar(value="")
-        ttk.Entry(out_row, textvariable=self.output_dir_var, width=28).pack(
+        ttk.Entry(out_row, textvariable=self.output_dir_var, width=26).pack(
             side="left", fill="x", expand=True, padx=6
         )
         ttk.Button(out_row, text="폴더 선택", width=9, command=self._on_browse_output_dir).pack(side="left", padx=2)
@@ -324,9 +337,9 @@ class SubtitleGeneratorGUI:
         llm_frame.columnconfigure(3, weight=1)
 
         # =====================================================================
-        # 3. 하단: 전체 대기열 진행률 / 현재 파일 진행률 및 실행 제어
+        # 3. 하단: 전체 대기열 진행률 / 현재 파일 진행률 및 즉시 중단 / 실행 제어
         # =====================================================================
-        prog_frame = ttk.LabelFrame(self.root, text="4. 작업 진행 상태 및 실행 제어")
+        prog_frame = ttk.LabelFrame(self.root, text="4. 작업 진행 상태 및 실행/중단 제어")
         prog_frame.pack(fill="x", **pad)
 
         # 대기열 전체 진행률
@@ -351,7 +364,7 @@ class SubtitleGeneratorGUI:
             side="left", fill="x", expand=True, padx=6
         )
 
-        # 상태 메시지 및 시작/중지 버튼
+        # 상태 메시지 및 시작 / 즉시 중단 / 예약 중지 버튼
         ctrl_row = ttk.Frame(prog_frame)
         ctrl_row.pack(fill="x", padx=10, pady=(4, 6))
 
@@ -360,13 +373,22 @@ class SubtitleGeneratorGUI:
         )
         ttk.Label(ctrl_row, textvariable=self.detail_label_var).pack(side="left", fill="x", expand=True)
 
+        self.abort_btn = ttk.Button(
+            ctrl_row,
+            text="🛑 현재 작업 즉시 중단 (중간저장)",
+            style="Danger.TButton",
+            state="disabled",
+            command=self._on_abort_now,
+        )
+        self.abort_btn.pack(side="right", padx=4, ipadx=8, ipady=3)
+
         self.stop_btn = ttk.Button(
             ctrl_row,
-            text="⏹ 현재 파일 완료 후 중지",
+            text="⏸ 현재 영화 완료 후 중지",
             state="disabled",
             command=self._on_stop_queue,
         )
-        self.stop_btn.pack(side="right", padx=4, ipadx=8, ipady=3)
+        self.stop_btn.pack(side="right", padx=4, ipadx=6, ipady=3)
 
         self.start_btn = ttk.Button(
             ctrl_row,
@@ -374,12 +396,12 @@ class SubtitleGeneratorGUI:
             style="Accent.TButton",
             command=self._on_start_queue,
         )
-        self.start_btn.pack(side="right", padx=4, ipadx=14, ipady=3)
+        self.start_btn.pack(side="right", padx=4, ipadx=12, ipady=3)
 
         # =====================================================================
         # 4. 최하단: 실시간 작업 로그
         # =====================================================================
-        log_frame = ttk.LabelFrame(self.root, text="실시간 작업 로그")
+        log_frame = ttk.LabelFrame(self.root, text="실시간 작업 및 성능 리포트 로그")
         log_frame.pack(fill="both", expand=False, **pad)
 
         self.log_box = scrolledtext.ScrolledText(log_frame, height=7, state="disabled", font=("Consolas", 9))
@@ -396,6 +418,10 @@ class SubtitleGeneratorGUI:
             self.log_box.configure(state="disabled")
 
         self.root.after(0, _update)
+
+    def _get_output_dir(self) -> Optional[Path]:
+        out_str = self.output_dir_var.get().strip()
+        return Path(out_str) if out_str else None
 
     def _sync_ui_to_config(self) -> Dict:
         lang_code = self.global_lang_var.get().split()[0]
@@ -491,11 +517,12 @@ class SubtitleGeneratorGUI:
         threading.Thread(target=_worker, daemon=True).start()
 
     # -------------------------------------------------------------------------
-    # 영화 리스트(Queue) 추가/삭제/정렬 관리
+    # 영화 리스트(Queue) 및 중간 생산물 작업 폴더 관리
     # -------------------------------------------------------------------------
     def _add_paths_to_queue(self, paths: List[Path]) -> None:
         existing_paths = {item.video_path for item in self.queue_items.values()}
         added_count = 0
+        out_dir = self._get_output_dir()
 
         for p in paths:
             p = p.resolve()
@@ -506,7 +533,9 @@ class SubtitleGeneratorGUI:
 
             self._item_counter += 1
             item_id = f"item_{self._item_counter}"
-            q_item = QueueItem(item_id=item_id, video_path=p)
+            ws = MovieWorkspace(p, out_dir)
+            init_status = ws.inspect_resume_status()
+            q_item = QueueItem(item_id=item_id, video_path=p, status=init_status)
 
             try:
                 info = inspect_video_metadata(p)
@@ -538,7 +567,7 @@ class SubtitleGeneratorGUI:
 
         self._refresh_tree_numbers()
         if added_count > 0:
-            self._append_log(f"[리스트 추가] 영화 {added_count}편이 대기열에 등록되었습니다.")
+            self._append_log(f"[리스트 추가] 영화 {added_count}편이 대기열에 등록되었습니다 (작업 폴더 중간 생산물 상태 자동 감지).")
 
     def _refresh_tree_numbers(self) -> None:
         for idx, item_id in enumerate(self.queue_order, start=1):
@@ -588,6 +617,9 @@ class SubtitleGeneratorGUI:
         self._refresh_tree_numbers()
 
     def _on_remove_selected(self) -> None:
+        if self.is_running:
+            messagebox.showwarning("작업 실행 중", "작업 실행 중에는 항목을 삭제할 수 없습니다.")
+            return
         selected = self.tree.selection()
         if not selected:
             return
@@ -598,6 +630,34 @@ class SubtitleGeneratorGUI:
                 self.queue_order.remove(item_id)
             self.tree.delete(item_id)
         self._refresh_tree_numbers()
+
+    def _on_reset_selected_artifacts(self) -> None:
+        if self.is_running:
+            messagebox.showwarning("작업 실행 중", "작업 실행 중에는 중간 생산물을 초기화할 수 없습니다.")
+            return
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("항목 미선택", "중간 생산물(작업 폴더)을 초기화할 영화를 먼저 선택해 주세요.")
+            return
+
+        if not messagebox.askyesno(
+            "중간 생산물 초기화 확인",
+            f"선택한 {len(selected)}편 영화의 작업 폴더(<영화이름>_work) 내 중간 생산물을 모두 삭제하고\n"
+            "'새 작업' 상태로 되돌리시겠습니까?",
+        ):
+            return
+
+        out_dir = self._get_output_dir()
+        for item_id in selected:
+            q_item = self.queue_items.get(item_id)
+            if not q_item:
+                continue
+            ws = MovieWorkspace(q_item.video_path, out_dir)
+            ws.clear_artifacts()
+            q_item.status = "대기 중 (새 작업)"
+
+        self._refresh_tree_numbers()
+        self._append_log(f"[중간 생산물 초기화] 선택한 {len(selected)}편의 작업 폴더를 초기화했습니다.")
 
     def _on_clear_completed(self) -> None:
         to_remove = [
@@ -632,8 +692,24 @@ class SubtitleGeneratorGUI:
         if target_dir and target_dir.exists():
             os.startfile(str(target_dir))
 
+    def _on_open_work_folder(self) -> None:
+        selected = self.tree.selection()
+        target_item: Optional[QueueItem] = None
+        if selected and selected[0] in self.queue_items:
+            target_item = self.queue_items[selected[0]]
+        elif self.queue_order:
+            target_item = self.queue_items[self.queue_order[0]]
+
+        if not target_item:
+            messagebox.showinfo("항목 없음", "먼저 리스트에 영화를 추가하거나 선택해 주세요.")
+            return
+
+        ws = MovieWorkspace(target_item.video_path, self._get_output_dir())
+        ws.ensure_dir()
+        os.startfile(str(ws.work_dir))
+
     def _on_browse_output_dir(self) -> None:
-        folder = filedialog.askdirectory(title="생성된 자막을 저장할 폴더 선택")
+        folder = filedialog.askdirectory(title="생성된 자막 및 작업 폴더를 저장할 위치 선택")
         if folder:
             self.output_dir_var.set(folder)
 
@@ -691,57 +767,78 @@ class SubtitleGeneratorGUI:
         )
 
     # -------------------------------------------------------------------------
-    # 대기열 순차 실행 및 중지 제어
+    # 대기열 순차 실행, 즉시 중단(Abort), 현재 영화 완료 후 중지 제어
     # -------------------------------------------------------------------------
+    def _on_abort_now(self) -> None:
+        """현재 실행 중인 변환 작업을 즉시 중단(중간 생산물은 안전하게 보존)합니다."""
+        if not self.is_running:
+            return
+        self.stop_requested = True
+        self.cancel_event.set()
+        self.abort_btn.configure(state="disabled")
+        self.stop_btn.configure(state="disabled")
+        self.stage_label_var.set("🛑 즉시 중단 처리 중...")
+        self.detail_label_var.set("현재까지 완료된 중간 생산물을 작업 폴더(_work)에 저장하고 즉시 멈춥니다...")
+        self._append_log("[🛑 즉시 중단 요청] 현재 진행 중인 작업을 즉시 중단하고 중간 생산물을 보존합니다.")
+
     def _on_stop_queue(self) -> None:
+        """현재 영화까지는 완료하고 다음 대기열 영화부터 중지합니다."""
         if not self.is_running:
             return
         self.stop_requested = True
         self.stop_btn.configure(state="disabled")
-        self._append_log("[중지 예약] 현재 처리 중인 영화의 자막 생성이 끝나면 대기열 작업을 중지합니다.")
+        self._append_log("[⏸ 중지 예약] 현재 처리 중인 영화의 자막 생성이 끝나면 대기열 작업을 중지합니다.")
 
     def _on_start_queue(self) -> None:
         if self.is_running:
             return
 
-        pending_ids = [
-            iid for iid in self.queue_order if not self.queue_items[iid].status.startswith("✅")
-        ]
+        use_resume = bool(self.resume_var.get())
+        if use_resume:
+            pending_ids = [
+                iid for iid in self.queue_order if not self.queue_items[iid].status.startswith("✅")
+            ]
+        else:
+            pending_ids = list(self.queue_order)
+
         if not pending_ids:
             messagebox.showwarning(
                 "처리할 영화 없음",
-                "대기열에 처리할 영화가 없습니다. 영화 파일을 추가하거나 완료 항목을 초기화해 주세요.",
+                "대기열에 처리할 영화가 없습니다.\n이미 완료된 영화를 다시 실행하려면 [♻️ 중간생산물 초기화]를 누르거나 새 영화를 추가해 주세요.",
             )
             return
 
         self._sync_ui_to_config()
         skip_translation = bool(self.skip_trans_var.get())
-        out_dir_str = self.output_dir_var.get().strip()
-        output_dir = Path(out_dir_str) if out_dir_str else None
+        output_dir = self._get_output_dir()
 
         self.is_running = True
         self.stop_requested = False
+        self.cancel_event.clear()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
+        self.abort_btn.configure(state="normal")
 
         total_jobs = len(pending_ids)
         self._append_log("=" * 72)
-        self._append_log(f"[대기열 시작] 총 {total_jobs}편의 영화 자막 생성을 시작합니다.")
+        self._append_log(
+            f"[대기열 시작] 총 {total_jobs}편 처리 시작 (중간 생산물 이어하기: {'ON' if use_resume else 'OFF - 처음부터'})"
+        )
 
         def _worker() -> None:
             completed_count = 0
+            aborted = False
             try:
                 for idx, item_id in enumerate(pending_ids, start=1):
-                    if self.stop_requested:
-                        self._append_log("[작업 중지됨] 사용자 요청으로 대기열 실행을 멈췄습니다.")
+                    if self.stop_requested or self.cancel_event.is_set():
+                        self._append_log("[대기열 중단됨] 사용자 요청으로 남은 대기열 실행을 멈췄습니다.")
                         break
 
                     q_item = self.queue_items.get(item_id)
                     if not q_item:
                         continue
 
-                    # 개별 영화용 config 사본 구성
-                    job_cfg = dataclasses.replace if False else {
+                    job_cfg = {
                         "stt": dict(self.config["stt"]),
                         "llm": dict(self.config["llm"]),
                         "subtitle": dict(self.config["subtitle"]),
@@ -780,7 +877,10 @@ class SubtitleGeneratorGUI:
                         if pct in (0.0, 100.0) or "완료" in stage:
                             self._append_log(f"[{q_item.video_path.name} | {stage}] {detail}")
 
-                    self._append_log(f"\n---> [{idx}/{total_jobs}] '{q_item.video_path.name}' 처리 시작")
+                    ws = MovieWorkspace(q_item.video_path, output_dir)
+                    self._append_log(
+                        f"\n---> [{idx}/{total_jobs}] '{q_item.video_path.name}' 처리 시작 (작업폴더: {ws.work_dir.name})"
+                    )
                     try:
                         out_files = process_video_file(
                             video_path=q_item.video_path,
@@ -789,28 +889,51 @@ class SubtitleGeneratorGUI:
                             language_override=q_item.language_override,
                             output_dir=output_dir,
                             skip_translation=skip_translation,
+                            resume=use_resume,
+                            cancel_event=self.cancel_event,
                             status_callback=status_cb,
                         )
                         q_item.generated_files = out_files
-                        update_item_status("✅ 완료", item_id)
+                        update_item_status("✅ 완료 (산출물 보유)", item_id)
                         completed_count += 1
+                    except JobCancelledError as cancel_exc:
+                        aborted = True
+                        resume_state = ws.inspect_resume_status()
+                        update_item_status(f"⏸ 중단됨 ({resume_state})", item_id)
+                        self._append_log(
+                            f"[🛑 작업 즉시 중단 완료 | {q_item.video_path.name}] {cancel_exc}\n"
+                            f" -> 작업 폴더({ws.work_dir.name})에 저장된 상태: {resume_state}\n"
+                            f" -> 다시 [▶ 대기열 자막 생성 시작]을 누르면 저장된 중간 생산물부터 즉시 이어서 진행합니다."
+                        )
+                        self.root.after(
+                            0,
+                            lambda rs=resume_state: (
+                                self.stage_label_var.set("🛑 작업 중단됨 (중간 생산물 저장 완료)"),
+                                self.detail_label_var.set(f"중단 상태: {rs} — 언제든 이어하기가 가능합니다."),
+                            ),
+                        )
+                        break
                     except Exception as exc:
                         logging.exception("파일 처리 중 오류: %s", q_item.video_path)
-                        update_item_status("❌ 오류", item_id)
+                        resume_state = ws.inspect_resume_status()
+                        update_item_status(f"❌ 오류 ({resume_state})", item_id)
                         self._append_log(f"[오류 | {q_item.video_path.name}] {exc}")
 
-                self.root.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "대기열 작업 완료",
-                        f"총 {total_jobs}편 중 {completed_count}편의 자막 생성이 완료되었습니다!",
-                    ),
-                )
+                if not aborted:
+                    self.root.after(
+                        0,
+                        lambda: messagebox.showinfo(
+                            "대기열 작업 완료",
+                            f"총 {total_jobs}편 중 {completed_count}편의 자막 생성이 완료되었습니다!",
+                        ),
+                    )
             finally:
                 self.is_running = False
                 self.stop_requested = False
+                self.cancel_event.clear()
                 self.root.after(0, lambda: self.start_btn.configure(state="normal"))
                 self.root.after(0, lambda: self.stop_btn.configure(state="disabled"))
+                self.root.after(0, lambda: self.abort_btn.configure(state="disabled"))
 
         threading.Thread(target=_worker, daemon=True).start()
 

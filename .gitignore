@@ -9,6 +9,7 @@ __pycache__/
 *.wav
 *.srt
 *.ass
+*_work/
 logs/
 
 # IDE & OS files
