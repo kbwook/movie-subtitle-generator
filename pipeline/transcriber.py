@@ -11,21 +11,45 @@ from __future__ import annotations
 
 import gc
 import logging
+import wave
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+import av
+import numpy as np
 from faster_whisper import WhisperModel
 
 from pipeline.models import SubtitleSegment
 
 logger = logging.getLogger(__name__)
 
+# PyAV 19+에서 제거된 metadata_errors 인자를 faster-whisper가 호출할 때 발생하는 호환성 오류 방어 패치
+_orig_av_open = av.open
+
+
+def _compat_av_open(*args, **kwargs):
+    kwargs.pop("metadata_errors", None)
+    return _orig_av_open(*args, **kwargs)
+
+
+av.open = _compat_av_open
+
 LANGUAGE_NAME_MAP = {
     "zh": "중국어 (Chinese)",
     "ja": "일본어 (Japanese)",
     "en": "영어 (English)",
     "ko": "한국어 (Korean)",
+    "fr": "프랑스어 (French)",
 }
+
+
+def load_wav_as_float32(wav_path: Path) -> np.ndarray:
+    """16kHz 16-bit Mono PCM WAV 파일을 Whisper 입력용 1D float32 배열(-1.0 ~ 1.0)로 즉시 로드합니다."""
+    with wave.open(str(wav_path), "rb") as wf:
+        num_frames = wf.getnframes()
+        pcm_bytes = wf.readframes(num_frames)
+    audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    return audio
 
 
 def transcribe_audio(
@@ -71,8 +95,11 @@ def transcribe_audio(
     detected_lang = whisper_lang or "en"
 
     try:
+        # PyAV 재디코딩을 거치지 않고 16kHz float32 파형 배열을 직접 전달하여 속도 향상 및 호환성 보장
+        audio_waveform = load_wav_as_float32(wav_path)
+
         segments_gen, info = model.transcribe(
-            str(wav_path),
+            audio_waveform,
             language=whisper_lang,
             task="transcribe",
             beam_size=beam_size,
@@ -82,7 +109,7 @@ def transcribe_audio(
         )
 
         detected_lang = info.language
-        total_duration = info.duration or 0.0
+        total_duration = info.duration or (len(audio_waveform) / 16000.0)
         lang_label = LANGUAGE_NAME_MAP.get(detected_lang, detected_lang)
         logger.info(
             "음성 언어 감지 완료: %s (확률: %.1f%%), 전체 길이: %.1f초",
@@ -107,7 +134,7 @@ def transcribe_audio(
 
             if progress_callback and total_duration > 0:
                 pct = min(100.0, (seg.end / total_duration) * 100.0)
-                progress_callback(pct, f"[{ seg.end:.1f}s / {total_duration:.1f}s] {text[:40]}")
+                progress_callback(pct, f"[{seg.end:.1f}s / {total_duration:.1f}s] {text[:40]}")
 
         if progress_callback:
             progress_callback(100.0, f"음성 인식 완료 (총 {len(segments_out)}개 대사)")

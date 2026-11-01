@@ -19,6 +19,7 @@ from pipeline.extractor import (
 )
 from pipeline.formatter import write_ass, write_srt
 from pipeline.models import SubtitleSegment
+from pipeline.transcriber import load_wav_as_float32
 from pipeline.translator import LocalLLMTranslator
 
 
@@ -85,6 +86,15 @@ class PipelineTest(unittest.TestCase):
             self.assertTrue(out_wav.exists())
             self.assertGreater(out_wav.stat().st_size, 16000)
             self.assertEqual(chosen.index, 0)
+
+            # faster-whisper 호환 float32 배열 로드 및 PyAV 19 metadata_errors 패치 검증
+            waveform = load_wav_as_float32(out_wav)
+            self.assertEqual(waveform.dtype, np.float32)
+            self.assertEqual(waveform.ndim, 1)
+            self.assertGreater(len(waveform), 8000)
+
+            with av.open(str(out_wav), mode="r", metadata_errors="ignore") as c:
+                self.assertEqual(len(c.streams.audio), 1)
 
     def test_llm_json_parsing_and_formatting(self) -> None:
         raw_json = """```json
