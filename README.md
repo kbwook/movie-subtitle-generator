@@ -12,7 +12,7 @@
 | :--- | :--- | :--- | :--- |
 | **1단계: 코덱 분석 & 오디오 추출** | `pipeline/extractor.py` | **Native FFmpeg C 바이너리** (`imageio-ffmpeg`) + **PyAV** | 별도 외부 코덱 설치 없이 H.264/HEVC/AV1 비디오 및 AAC, AC3, E-AC3, DTS, FLAC, Opus 등 모든 오디오 트랙을 탐색하고 **16kHz Mono 16-bit PCM WAV**로 초고속 디코딩 (2시간 영화 기준 ~3초) |
 | **2단계: 다국어 음성 인식 (STT)** | `pipeline/transcriber.py` | **Intel OpenVINO GenAI** (`GPU` / `NPU`) & **Faster-Whisper** (`CPU`) + **Silero VAD** | **Intel Arc 내장 GPU (`GPU`)** 및 **Intel AI Boost (`NPU`)** OpenVINO 하드웨어 가속 지원(`OpenVINO/whisper-large-v3-turbo-int8-ov` 등) + 멀티코어 CPU(`CTranslate2 int8`) 선택 가능. `Silero VAD` 음성 구간 검출로 영화 배경음악(BGM) 환각 차단 및 **STT 완료 즉시 메모리 해제** |
-| **3단계: 문맥 기반 로컬 LLM 번역** | `pipeline/translator.py` | **Ollama** (`qwen2.5:7b` 기본 / `14b` 선택) | Intel Arc 내장 GPU의 **Vulkan 가속(`OLLAMA_VULKAN=1`)** 및 백그라운드 서버 자동 구동. 직전 5문장(문맥 참조) + 현재 10문장 배치를 JSON 스키마로 묶어 번역하여 화자의 반말/존댓말과 고유명사 일관성 유지 |
+| **3단계: 문맥 기반 로컬 LLM 번역** | `pipeline/translator.py` | **Ollama** (`qwen2.5:7b` 기본 / `14b` 선택) | Intel Arc 내장 GPU **100% Vulkan 가속(`OLLAMA_VULKAN=1`, `OLLAMA_IGPU_ENABLE=1`)** 및 백그라운드 서버 자동 구동/복구. 직전 5문장(문맥 참조) + 현재 10문장 배치를 JSON 스키마로 묶어 번역하여 화자의 반말/존댓말과 고유명사 일관성 유지 |
 | **4단계: 자막 포맷팅 및 싱크 보정** | `pipeline/formatter.py` | 자체 SRT / ASS 렌더러 | 타임스탬프 겹침 및 최소 노출 시간 자동 보정. **한국어 단독 자막**, **한글+외국어 원문 이중 자막**, **원문 자막(`.orig.srt`)** 동시 출력 지원 |
 
 ---
@@ -92,6 +92,10 @@
 
 # 7. LLM 번역 없이 원문 자막(STT)만 빠르게 추출
 .\.venv\Scripts\python.exe main.py "D:\Movies\en_movie.mp4" --lang en --no-translate
+
+# 8. STT 가속 장치 명시 지정 (GPU: Intel Arc OpenVINO, NPU: Intel AI Boost OpenVINO, CPU: Faster-Whisper)
+.\.venv\Scripts\python.exe main.py "D:\Movies\sample_movie.mkv" --stt-device GPU
+.\.venv\Scripts\python.exe main.py "D:\Movies\sample_movie.mkv" --stt-device NPU
 ```
 
 ---
