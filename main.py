@@ -37,14 +37,26 @@ from pipeline.workspace import JobCancelledError, MovieWorkspace
 
 
 def setup_logging() -> None:
-    if hasattr(sys.stdout, "reconfigure"):
+    if hasattr(sys.stdout, "reconfigure") and sys.stdout is not None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if hasattr(sys.stderr, "reconfigure"):
+    if hasattr(sys.stderr, "reconfigure") and sys.stderr is not None:
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+    logs_dir = Path(__file__).resolve().parent / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    app_log_path = logs_dir / "app_execution.log"
+
+    handlers: list[logging.Handler] = [
+        logging.FileHandler(app_log_path, encoding="utf-8"),
+    ]
+    if sys.stderr is not None:
+        handlers.append(logging.StreamHandler(sys.stderr))
+
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
     )
 
 

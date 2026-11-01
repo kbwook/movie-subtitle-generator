@@ -411,6 +411,14 @@ class SubtitleGeneratorGUI:
     # 유틸리티 및 로그 메서드
     # -------------------------------------------------------------------------
     def _append_log(self, msg: str) -> None:
+        try:
+            logs_dir = Path(__file__).resolve().parent / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            with open(logs_dir / "app_execution.log", "a", encoding="utf-8") as lf:
+                lf.write(msg + "\n")
+        except OSError:
+            pass
+
         def _update():
             self.log_box.configure(state="normal")
             self.log_box.insert("end", msg + "\n")
@@ -475,14 +483,16 @@ class SubtitleGeneratorGUI:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_open_perf_log(self) -> None:
-        log_file = Path(__file__).resolve().parent / "logs" / "perf_report.log"
-        if log_file.exists():
-            os.startfile(str(log_file))
+        logs_dir = Path(__file__).resolve().parent / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        perf_file = logs_dir / "perf_report.log"
+        app_log_file = logs_dir / "app_execution.log"
+        if perf_file.exists():
+            os.startfile(str(perf_file))
+        elif app_log_file.exists():
+            os.startfile(str(app_log_file))
         else:
-            messagebox.showinfo(
-                "성능 리포트 없음",
-                "아직 기록된 성능 리포트(logs/perf_report.log)가 없습니다.\n영화 자막 생성이 완료되면 자동으로 기록됩니다.",
-            )
+            os.startfile(str(logs_dir))
 
     def _on_pull_or_check_model(self) -> None:
         model_name = self.llm_var.get().strip()
