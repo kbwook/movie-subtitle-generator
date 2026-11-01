@@ -55,8 +55,8 @@ class LocalLLMTranslator:
         self.movie_context = llm_config.get("movie_context", "").strip()
         self.last_telemetry: Dict[str, Any] = {}
 
-    def _try_start_ollama_server(self) -> bool:
-        """Ollama 서버가 꺼져 있을 때 Intel Arc Vulkan 가속(OLLAMA_VULKAN=1)과 함께 자동 구동합니다."""
+    def _try_start_ollama_server(self, force_restart: bool = False) -> bool:
+        """Ollama 서버가 꺼져 있거나 CPU 단독 모드일 때 Intel Arc iGPU Vulkan 가속(OLLAMA_VULKAN=1, OLLAMA_IGPU_ENABLE=1)으로 구동합니다."""
         ollama_bin = shutil.which("ollama")
         if not ollama_bin:
             candidate = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe"
@@ -65,11 +65,26 @@ class LocalLLMTranslator:
         if not ollama_bin:
             return False
 
-        env = os.environ.copy()
-        env["OLLAMA_VULKAN"] = "1"
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
             subprocess, "DETACHED_PROCESS", 0
         )
+
+        if force_restart:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", "ollama app.exe", "/IM", "ollama.exe"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    timeout=5,
+                )
+                time.sleep(1.0)
+            except Exception as exc:
+                logger.debug("기존 Ollama 프로세스 종료 중 예외(무시): %s", exc)
+
+        env = os.environ.copy()
+        env["OLLAMA_VULKAN"] = "1"
+        env["OLLAMA_IGPU_ENABLE"] = "1"
         try:
             subprocess.Popen(
                 [ollama_bin, "serve"],
@@ -78,12 +93,14 @@ class LocalLLMTranslator:
                 stderr=subprocess.DEVNULL,
                 creationflags=creationflags,
             )
-            for _ in range(12):
+            for _ in range(14):
                 time.sleep(0.5)
                 try:
                     r = requests.get(f"{self.base_url}/api/tags", timeout=2)
                     if r.status_code == 200:
-                        logger.info("Ollama 백그라운드 서버 자동 시작 완료 (OLLAMA_VULKAN=1)")
+                        logger.info(
+                            "Ollama 백그라운드 서버 자동 시작 완료 (OLLAMA_VULKAN=1, OLLAMA_IGPU_ENABLE=1)"
+                        )
                         return True
                 except requests.RequestException:
                     continue
@@ -204,8 +221,24 @@ class LocalLLMTranslator:
             # 첫 번째 실제 배치가 메모리에 적재된 직후 /api/ps를 조회하여 실제 GPU/CPU 오프로딩 상태 확인
             if batches_count == 1:
                 ps_info = query_ollama_processor_status(self.base_url, self.model)
+                if ps_info.get("gpu_offload_pct", 0.0) == 0.0:
+                    logger.warning(
+                        "[LLM 가속 자동 복구] 기존 Ollama 서버가 내장 GPU 제외(CPU 단독) 모드로 실행 중입니다. "
+                        "Intel Arc iGPU 가속(OLLAMA_VULKAN=1, OLLAMA_IGPU_ENABLE=1)을 적용하여 서버를 재시작합니다..."
+                    )
+                    if self._try_start_ollama_server(force_restart=True):
+                        # 두 번째 배치에서 GPU 적재 상태를 다시 조회하도록 유도
+                        ps_info = {}
+                if ps_info:
+                    logger.info(
+                        "[LLM 하드웨어 가속 상태] 장치=%s | 상세=%s",
+                        ps_info.get("accelerator"),
+                        ps_info.get("processor_summary"),
+                    )
+            elif batches_count == 2 and not ps_info:
+                ps_info = query_ollama_processor_status(self.base_url, self.model)
                 logger.info(
-                    "[LLM 하드웨어 가속 상태] 장치=%s | 상세=%s",
+                    "[LLM 하드웨어 가속 상태 (재시작 후)] 장치=%s | 상세=%s",
                     ps_info.get("accelerator"),
                     ps_info.get("processor_summary"),
                 )

@@ -8,8 +8,10 @@ $ErrorActionPreference = "Continue"
 
 Write-Host "=== [1/3] Intel Arc GPU Vulkan 가속 환경변수 설정 ===" -ForegroundColor Cyan
 [Environment]::SetEnvironmentVariable("OLLAMA_VULKAN", "1", "User")
+[Environment]::SetEnvironmentVariable("OLLAMA_IGPU_ENABLE", "1", "User")
 $env:OLLAMA_VULKAN = "1"
-Write-Host "-> OLLAMA_VULKAN=1 설정 완료 (Intel Arc 내장 GPU 가속 활성화)" -ForegroundColor Green
+$env:OLLAMA_IGPU_ENABLE = "1"
+Write-Host "-> OLLAMA_VULKAN=1 및 OLLAMA_IGPU_ENABLE=1 설정 완료 (Intel Arc 내장 GPU 가속 활성화)" -ForegroundColor Green
 
 Write-Host "`n=== [2/3] Ollama 설치 상태 확인 ===" -ForegroundColor Cyan
 $ollamaPath = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
