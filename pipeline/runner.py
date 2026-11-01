@@ -86,6 +86,42 @@ def process_video_file(
         workspace.clear_artifacts()
     work_dir = workspace.ensure_dir()
 
+    # 실시간 파일 로거 핸들러 등록 (공용 logs/app_execution.log 및 작업폴더 내 job_execution.log 즉시 생성)
+    project_logs_dir = Path(__file__).resolve().parent.parent / "logs"
+    project_logs_dir.mkdir(parents=True, exist_ok=True)
+    app_log_file = project_logs_dir / "app_execution.log"
+    job_log_file = work_dir / "job_execution.log"
+
+    def _write_realtime_log(stage_str: str, pct_val: float, msg_str: str) -> None:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{ts} [{video_path.name} | {stage_str} | {pct_val:5.1f}%] {msg_str}\n"
+        for log_p in (app_log_file, job_log_file):
+            try:
+                with open(log_p, "a", encoding="utf-8") as lf:
+                    lf.write(line)
+                    lf.flush()
+            except OSError:
+                pass
+
+    last_logged_bucket: Dict[str, int] = {}
+
+    orig_status_callback = status_callback
+
+    def wrapped_status_cb(stage_str: str, pct_val: float, msg_str: str) -> None:
+        bucket = int(pct_val // 5)  # 5% 단위로 실시간 디스크 로그 기록
+        if (
+            pct_val in (0.0, 100.0)
+            or "완료" in stage_str
+            or last_logged_bucket.get(stage_str) != bucket
+        ):
+            last_logged_bucket[stage_str] = bucket
+            _write_realtime_log(stage_str, pct_val, msg_str)
+        if orig_status_callback:
+            orig_status_callback(stage_str, pct_val, msg_str)
+
+    status_callback = wrapped_status_cb
+    _write_realtime_log("작업 시작", 0.0, f"작업 폴더 생성 및 파이프라인 시작: {work_dir}")
+
     hw_inv = detect_hardware_inventory()
     media_info = inspect_video_metadata(video_path)
     stage_metrics: List[StageMetric] = []
